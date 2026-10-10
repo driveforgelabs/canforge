@@ -1,0 +1,25 @@
+[package]
+name = "canforge"
+version = "0.1.0"
+edition = "2024"
+description = "Simple OBD-II car diagnostics built on GPUI, gpui-kit and candriver."
+license = "Apache-2.0"
+
+[dependencies]
+gpui-kit = "0.7.1"
+candriver-core = { path = "../candriver/crates/candriver-core" }
+candriver-op20 = { path = "../candriver/crates/candriver-op20" }
+candriver-obd = { path = "../candriver/crates/candriver-obd" }
+candriver-uds = { path = "../candriver/crates/candriver-uds" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+# GPUI and its dependencies (wgpu, text shaping, …) are far too slow unoptimised, which shows up as
+# laggy scrolling and redraws. Optimise dependencies even in dev builds; the app's own code stays
+# quick to rebuild.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+debug = "line-tables-only"
