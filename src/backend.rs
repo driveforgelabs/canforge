@@ -8,7 +8,7 @@ use std::time::Duration;
 use candriver_core::{CanBus, CanConfig, Driver};
 use candriver_obd::readiness::{self, Readiness};
 use candriver_uds::discover::{self, DidFinding, Support};
-use candriver_uds::{DtcReport, UdsClient, UdsDtc, nrc_name};
+use candriver_uds::{DidResult, DtcReport, Response, UdsClient, UdsDtc, nrc_name};
 use candriver_obd::{Addressing, ClearResult, Dtc, DtcKind, ObdClient, pid};
 use candriver_op20::Op20Driver;
 
@@ -25,6 +25,15 @@ pub enum Cmd {
     ReadVin,
     /// Read every data identifier F100–F1FF of one module. Read-only.
     SweepDids { tx_id: u32 },
+    /// Read one data identifier of one module (UDS 0x22). Read-only.
+    ReadDid { tx_id: u32, did: u16 },
+    /// Read each of these data identifiers (UDS 0x22) to learn which this module has, keeping the
+    /// answers. Read-only; stops on `CancelSweep`.
+    ProbeDids { tx_id: u32, dids: Vec<u16> },
+    /// Start a UDS routine (0x31 0x01) after optionally opening a diagnostic session (0x10).
+    /// This acts on the car: the UI asks the user to confirm first.
+    /// `option` is the routine's option record, sent after the routine ID.
+    RunRoutine { tx_id: u32, routine: u16, session: Option<u8>, option: Vec<u8> },
     /// Ask one module which routine identifiers (0x0000–0xFFFF) exist. Starts none; slow.
     /// (request ID, first routine ID) of every module to sweep, all at once.
     SweepRoutines { targets: Vec<(u32, u16)> },
@@ -106,6 +115,14 @@ pub enum Event {
     Freeze(Option<FreezeFrame>),
     Modules(Vec<ModuleView>),
     Dids { tx_id: u32, lines: Vec<DidLine> },
+    /// The answer to a [`Cmd::ReadDid`]: the data bytes, or why there are none.
+    DidValue { tx_id: u32, did: u16, result: Result<Vec<u8>, String> },
+    ProbeProgress { tx_id: u32, done: usize, total: usize },
+    /// What a probe found: each identifier the module has, with its data or why it was not readable.
+    Probed { tx_id: u32, found: Vec<(u16, Result<Vec<u8>, String>)>, note: String },
+    /// The module's answer to a [`Cmd::RunRoutine`]: the status bytes after the routine ID, or why not.
+    /// `after` is what was asked of the module afterwards: the routine's result and its trouble codes.
+    RoutineRun { tx_id: u32, routine: u16, result: Result<Vec<u8>, String>, after: String },
     /// Outcome of a user action, to show in the UI.
     Notice(String),
 }
@@ -241,6 +258,22 @@ fn run_simulated(tx: &Sender<Event>, rx: &Receiver<Cmd>) {
                     return;
                 }
             }
+            Ok(Cmd::ProbeDids { tx_id, dids }) => {
+                let found = dids.into_iter().filter(|d| matches!(d, 0xf405 | 0xf40c)).map(|d| (d, Ok(vec![0x1f, 0x40]))).collect();
+                if tx.send(Event::Probed { tx_id, found, note: "simulated".into() }).is_err() {
+                    return;
+                }
+            }
+            Ok(Cmd::RunRoutine { tx_id, routine, .. }) => {
+                if tx.send(Event::RoutineRun { tx_id, routine, result: Ok(Vec::new()), after: "simulated".into() }).is_err() {
+                    return;
+                }
+            }
+            Ok(Cmd::ReadDid { tx_id, did }) => {
+                if tx.send(Event::DidValue { tx_id, did, result: Ok(vec![0x1f, 0x40]) }).is_err() {
+                    return;
+                }
+            }
             Ok(Cmd::ClearDtcs) => {
                 codes.clear();
                 if tx.send(Event::Notice("Codes cleared.".into())).is_err() || !dtcs(tx, &codes) {
@@ -276,7 +309,7 @@ fn run_replay(session: &Session, speed: f64, tx: &Sender<Event>, rx: &Receiver<C
                 let wait = due.saturating_sub(start.elapsed());
                 match rx.recv_timeout(wait) {
                     Ok(Cmd::ClearDtcs) if !notice("A replay is read-only: nothing was cleared.") => return,
-                    Ok(Cmd::ScanModules | Cmd::SweepDids { .. } | Cmd::ReadVin | Cmd::SweepRoutines { .. }) if !notice("Module scans need a vehicle, not a replay.") => return,
+                    Ok(Cmd::ScanModules | Cmd::SweepDids { .. } | Cmd::ReadDid { .. } | Cmd::ProbeDids { .. } | Cmd::RunRoutine { .. } | Cmd::ReadVin | Cmd::SweepRoutines { .. }) if !notice("Module scans need a vehicle, not a replay.") => return,
                     Ok(_) => continue,
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => return,
@@ -428,6 +461,68 @@ impl VehicleLink {
                         let found = discover::sweep_dids(&client, 0xf100..=0xf1ff).map_err(|e| e.to_string())?;
                         let note = format!("Module {tx_id:03X}: {} data identifier(s) found.", found.len());
                         if tx.send(Event::Dids { tx_id, lines: did_lines(found) }).is_err() || tx.send(Event::Notice(note)).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Cmd::ReadDid { tx_id, did } => {
+                        let mut client = UdsClient::new(self.bus.as_ref(), tx_id, tx_id + 8);
+                        client.timeout = Duration::from_millis(300);
+                        let result = match client.read_did(did) {
+                            Ok(Some(DidResult::Data(d))) => Ok(d),
+                            Ok(Some(DidResult::Refused(0x31))) => Err("not supported by this module".to_string()),
+                            Ok(Some(DidResult::Refused(nrc))) => Err(format!("refused (code {nrc:02X}): needs conditions or security access")),
+                            Ok(None) => Err("no answer".to_string()),
+                            Err(e) => Err(e.to_string()),
+                        };
+                        if tx.send(Event::DidValue { tx_id, did, result }).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Cmd::ProbeDids { tx_id, dids } => {
+                        let mut client = UdsClient::new(self.bus.as_ref(), tx_id, tx_id + 8);
+                        client.timeout = Duration::from_millis(120);
+                        let total = dids.len();
+                        let mut found = Vec::new();
+                        let mut silent = 0u32;
+                        let mut note = String::new();
+                        for (i, did) in dids.into_iter().enumerate() {
+                            if i % 25 == 0 {
+                                if rx.try_recv().is_ok_and(|c| matches!(c, Cmd::CancelSweep)) {
+                                    note = "stopped".into();
+                                    break;
+                                }
+                                if tx.send(Event::ProbeProgress { tx_id, done: i, total }).is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            match client.read_did(did).map_err(|e| e.to_string())? {
+                                Some(DidResult::Data(d)) => {
+                                    silent = 0;
+                                    found.push((did, Ok(d)));
+                                }
+                                Some(DidResult::Refused(0x31)) => silent = 0,
+                                Some(DidResult::Refused(nrc)) => {
+                                    silent = 0;
+                                    found.push((did, Err(format!("exists, not readable now: {}", nrc_name(nrc)))));
+                                }
+                                None => {
+                                    silent += 1;
+                                    if silent >= 10 {
+                                        note = "the module stopped answering".into();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if tx.send(Event::Probed { tx_id, found, note }).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Cmd::RunRoutine { tx_id, routine, session, option } => {
+                        let mut client = UdsClient::new(self.bus.as_ref(), tx_id, tx_id + 8);
+                        client.timeout = Duration::from_millis(500);
+                        let (result, after) = run_routine(&client, routine, session, &option);
+                        if tx.send(Event::RoutineRun { tx_id, routine, result, after }).is_err() {
                             return Ok(());
                         }
                     }
@@ -651,6 +746,68 @@ fn routine_state(f: &discover::RoutineFinding) -> String {
         discover::RoutineFinding::Exists(0x24) => "exists, never started".into(),
         discover::RoutineFinding::Exists(nrc) => format!("exists, no results: {}", nrc_name(*nrc)),
     }
+}
+
+/// Starts a routine (0x31 0x01 + routine ID + `option`), opening `session` first if given. Modules refuse
+/// routines in the default session ("service not supported in active session"), so if that is the answer and
+/// no session was opened yet, the extended session is opened and the request repeated once.
+///
+/// After a start the module is asked for the routine's result (0x31 0x03) and for its stored trouble codes,
+/// since "accepted" only means the start request was understood. That follow-up is returned as text.
+fn run_routine(client: &UdsClient, routine: u16, session: Option<u8>, option: &[u8]) -> (Result<Vec<u8>, String>, String) {
+    if option.len() > 4 {
+        return (Err("the option record is limited to 4 bytes".into()), String::new());
+    }
+    let open = |session: u8| -> Result<(), String> {
+        match client.request(&[0x10, session]).map_err(|e| e.to_string())? {
+            Some(Response::Positive(_)) => Ok(()),
+            Some(Response::Negative(nrc)) => Err(format!("session refused: {}", nrc_name(nrc))),
+            None => Err("no answer when opening the session".into()),
+        }
+    };
+    let [hi, lo] = routine.to_be_bytes();
+    let start = || -> Result<Result<Vec<u8>, u8>, String> {
+        let mut request = vec![0x31, 0x01, hi, lo];
+        request.extend_from_slice(option);
+        match client.request(&request).map_err(|e| e.to_string())? {
+            Some(Response::Positive(m)) => Ok(Ok(m.get(4..).unwrap_or_default().to_vec())),
+            Some(Response::Negative(nrc)) => Ok(Err(nrc)),
+            None => Err("no answer".into()),
+        }
+    };
+    let started = (|| {
+        if let Some(s) = session {
+            open(s)?;
+        }
+        match start()? {
+            Ok(status) => Ok(status),
+            // 0x7E / 0x7F: not supported in the active session
+            Err(0x7e | 0x7f) if session.is_none() => {
+                open(0x03)?;
+                start()?.map_err(|nrc| format!("refused in the extended session too: {} (code {nrc:02X})", nrc_name(nrc)))
+            }
+            Err(nrc) => Err(format!("refused: {} (code {nrc:02X})", nrc_name(nrc))),
+        }
+    })();
+    if started.is_err() {
+        return (started, String::new());
+    }
+    std::thread::sleep(Duration::from_millis(1000));
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02X}")).collect::<Vec<_>>().join(" ");
+    let result = match client.request(&[0x31, 0x03, hi, lo]) {
+        Ok(Some(Response::Positive(m))) => format!("result: {}", hex(m.get(4..).unwrap_or_default())),
+        Ok(Some(Response::Negative(nrc))) => format!("no result available ({})", nrc_name(nrc)),
+        Ok(None) => "no answer to the result request".to_string(),
+        Err(e) => format!("result request failed: {e}"),
+    };
+    let codes = match client.read_dtcs(0xff) {
+        Ok(Some(DtcReport::Codes(c))) if c.is_empty() => "no stored trouble codes".to_string(),
+        Ok(Some(DtcReport::Codes(c))) => format!("trouble codes now: {}", c.iter().map(|d| d.display()).collect::<Vec<_>>().join(", ")),
+        Ok(Some(DtcReport::Refused(nrc))) => format!("trouble codes not readable ({})", nrc_name(nrc)),
+        Ok(None) => "no answer to the trouble code request".to_string(),
+        Err(e) => format!("trouble code request failed: {e}"),
+    };
+    (started, format!("{result}; {codes}"))
 }
 
 fn did_lines(found: Vec<(u16, DidFinding)>) -> Vec<DidLine> {

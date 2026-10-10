@@ -3,14 +3,16 @@ mod contribute;
 mod dbcmd;
 mod dump;
 mod dtcdb;
+mod functions;
 mod garage;
 mod import;
 mod modnames;
+mod params;
 mod session;
 mod sim;
 mod vin;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use backend::{Backend, Cmd, DidLine, DtcEntry, Event, FreezeFrame, ModuleView, RoutineScan};
@@ -109,12 +111,14 @@ enum Page {
     Live,
     Readiness,
     Modules,
+    Functions,
+    ModuleData,
     Contribute,
     Vehicles,
 }
 
 impl Page {
-    const ALL: [Page; 6] = [Page::Overview, Page::Codes, Page::Live, Page::Readiness, Page::Modules, Page::Contribute];
+    const ALL: [Page; 8] = [Page::Overview, Page::Codes, Page::Live, Page::Readiness, Page::Modules, Page::Functions, Page::ModuleData, Page::Contribute];
 
     fn label(self) -> &'static str {
         match self {
@@ -123,6 +127,8 @@ impl Page {
             Page::Live => "Live data",
             Page::Readiness => "Readiness",
             Page::Modules => "Modules",
+            Page::Functions => "Functions",
+            Page::ModuleData => "Module data",
             Page::Contribute => "Help improve",
             Page::Vehicles => "Vehicles",
         }
@@ -135,6 +141,8 @@ impl Page {
             Page::Live => IconName::ChartPie,
             Page::Readiness => IconName::CircleCheck,
             Page::Modules => IconName::Cpu,
+            Page::Functions => IconName::Frame,
+            Page::ModuleData => IconName::ChartPie,
             Page::Contribute => IconName::BookOpen,
             Page::Vehicles => IconName::Frame,
         }
@@ -206,6 +214,17 @@ struct Diagnostics {
     modules: Vec<ModuleView>,
     /// Data identifiers found per module request ID.
     dids: BTreeMap<u32, Vec<DidLine>>,
+    /// Module data page: the module shown, the filter applied, and what each Read returned.
+    param_module: Option<u32>,
+    param_query: String,
+    param_values: BTreeMap<(u32, u16), Result<Vec<u8>, String>>,
+    /// Identifiers each module answered to during a probe, and the probe in progress (module, done, total).
+    param_supported: BTreeMap<u32, BTreeSet<u16>>,
+    param_all: bool,
+    probe: Option<(u32, usize, usize)>,
+    /// Functions page: the run awaiting confirmation (module, index in its list) and what each run returned.
+    confirm_run: Option<(u32, usize)>,
+    run_results: BTreeMap<(u32, u16), (Result<Vec<u8>, String>, String)>,
     codes: Entity<TableState<DtcDelegate>>,
 }
 
@@ -302,6 +321,14 @@ impl Diagnostics {
             _subscriptions: vec![subscription],
             modules: Vec::new(),
             dids: BTreeMap::new(),
+            param_module: None,
+            param_query: String::new(),
+            param_values: BTreeMap::new(),
+            param_supported: BTreeMap::new(),
+            param_all: false,
+            probe: None,
+            confirm_run: None,
+            run_results: BTreeMap::new(),
             codes,
         }
     }
@@ -353,6 +380,27 @@ impl Diagnostics {
                             let _ = self.backend.cmds.send(Cmd::SweepDids { tx_id: m.tx_id });
                         }
                     }
+                }
+                Event::DidValue { tx_id, did, result } => {
+                    self.param_values.insert((tx_id, did), result);
+                }
+                Event::ProbeProgress { tx_id, done, total } => self.probe = Some((tx_id, done, total)),
+                Event::Probed { tx_id, found, note } => {
+                    self.probe = None;
+                    let mut dids = BTreeSet::new();
+                    for (did, result) in found {
+                        dids.insert(did);
+                        self.param_values.insert((tx_id, did), result);
+                    }
+                    self.notice = Some(format!("Module {tx_id:03X} answered {} identifier(s){}", dids.len(), if note.is_empty() { String::new() } else { format!(" ({note})") }));
+                    self.param_supported.insert(tx_id, dids);
+                }
+                Event::RoutineRun { tx_id, routine, result, after } => {
+                    self.notice = Some(match &result {
+                        Ok(_) => format!("Module {tx_id:03X}: routine {routine:04X} started."),
+                        Err(why) => format!("Module {tx_id:03X}: routine {routine:04X} {why}"),
+                    });
+                    self.run_results.insert((tx_id, routine), (result, after));
                 }
                 Event::Dids { tx_id, lines } => {
                     self.dids.insert(tx_id, lines);
@@ -443,7 +491,7 @@ impl Diagnostics {
 
     /// The Modules and Help improve pages need the module list: scan once per connection.
     fn ensure_modules(&mut self) {
-        let wanted = matches!(self.page, Page::Modules | Page::Contribute);
+        let wanted = matches!(self.page, Page::Modules | Page::Functions | Page::ModuleData | Page::Contribute);
         if wanted && !self.scan_requested && self.modules.is_empty() && matches!(self.link, Link::Online { .. }) {
             self.scan_requested = true;
             let _ = self.backend.cmds.send(Cmd::ScanModules);
@@ -1034,7 +1082,7 @@ impl Diagnostics {
                     cx.notify();
                 }))
                 .into_any_element(),
-            Page::Live | Page::Readiness => div().into_any_element(),
+            Page::Live | Page::Readiness | Page::Functions | Page::ModuleData => div().into_any_element(),
         }
     }
 
@@ -1058,6 +1106,8 @@ impl Diagnostics {
             Page::Modules => self.notice.clone().unwrap_or_else(|| {
                 if self.modules.is_empty() { "Scan the vehicle's diagnostic network for modules (read-only).".into() } else { format!("{} module(s)", self.modules.len()) }
             }),
+            Page::ModuleData => "Parameters FORScan knows for a module. Each one is read only when you press Read.".into(),
+            Page::Functions => "What each module can do, from your own FORScan import. Run… asks you to confirm first.".into(),
             Page::Vehicles => format!("{} saved · the VIN is read from the car when possible", self.vehicles.len()),
             Page::Contribute => "Name modules and describe codes the shared database does not know yet.".into(),
         }
@@ -1305,6 +1355,279 @@ impl Diagnostics {
             .size_full()
             .overflow_y_scroll()
             .children(self.modules.iter().map(|m| self.module_card(m, make.as_deref(), cx)).collect::<Vec<_>>())
+    }
+
+    /// Parameters FORScan knows for one module. Nothing is sent until Read is pressed on a row.
+    fn render_module_data(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        const SHOWN: usize = 60;
+        let theme = cx.theme().clone();
+        let note = |text: String| div().text_xs().text_color(theme.muted_foreground).child(text);
+        let known = params::get();
+        let mut page = v_flex().id("module-data").p_6().gap_3().size_full().overflow_y_scroll();
+        if known.is_empty() {
+            return page.child(note(
+                "No FORScan import found. Run scripts/forscan_import.py on your own forscan.sqlite with --write, then reopen this page. \
+                 The data stays on this computer."
+                    .into(),
+            ));
+        }
+        if self.modules.is_empty() {
+            return page.child(note("Scan the modules first (Modules page); parameters are listed for the modules found.".into()));
+        }
+        let make = self.make.clone();
+        let ids: Vec<(u32, String)> = self
+            .modules
+            .iter()
+            .map(|m| {
+                let name = self
+                    .own_module_name(m.tx_id)
+                    .map(String::from)
+                    .or_else(|| modnames::get().name(m.tx_id, make.as_deref()).map(String::from))
+                    .unwrap_or_else(|| "Module".to_string());
+                (m.tx_id, format!("{:03X} {name}", m.tx_id))
+            })
+            .collect();
+        let selected = self.param_module.filter(|id| ids.iter().any(|(i, _)| i == id)).unwrap_or(ids[0].0);
+        let search = self.input_for("params-search".into(), "Filter by name, e.g. injector", window, cx);
+        page = page
+            .child(note(
+                "Names, identifiers and scaling come from your own FORScan import. A module only answers for identifiers it has, \
+                 and the list covers every engine and software variant, so many will say not supported. Scaled values are unverified: \
+                 the raw bytes are always shown."
+                    .into(),
+            ))
+            .child(h_flex().gap_2().flex_wrap().children(ids.iter().map(|(id, label)| {
+                let id = *id;
+                Button::new(SharedString::from(format!("pm-{id}")))
+                    .label(label.clone())
+                    .when(id == selected, |b| b.primary())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.param_module = Some(id);
+                        cx.notify();
+                    }))
+            })))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().flex_1().child(Input::new(&search)))
+                    .child(Button::new("pm-search").label("Search").on_click(cx.listener(move |this, _, _, cx| {
+                        let query = this.inputs.get("params-search").map(|i| i.read(cx).value().trim().to_lowercase()).unwrap_or_default();
+                        this.param_query = query;
+                        cx.notify();
+                    }))),
+            );
+        let all = known.for_module(selected);
+        let supported = self.param_supported.get(&selected);
+        let probing = self.probe.filter(|(id, ..)| *id == selected);
+        page = page.child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(match probing {
+                    Some(_) => Button::new("pm-stop").label("Stop").on_click(cx.listener(|this, _, _, cx| {
+                        let _ = this.backend.cmds.send(Cmd::CancelSweep);
+                        cx.notify();
+                    })),
+                    None => Button::new("pm-probe").label("Check which this module has").on_click(cx.listener(move |this, _, _, cx| {
+                        let mut dids: Vec<u16> = params::get().for_module(selected).iter().map(|p| p.did).collect();
+                        dids.sort_unstable();
+                        dids.dedup();
+                        this.probe = Some((selected, 0, dids.len()));
+                        let _ = this.backend.cmds.send(Cmd::ProbeDids { tx_id: selected, dids });
+                        cx.notify();
+                    })),
+                })
+                .children(supported.map(|_| {
+                    Button::new("pm-all").label(if self.param_all { "Showing all: show only what it has" } else { "Showing only what it has: show all" }).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.param_all = !this.param_all;
+                            cx.notify();
+                        }),
+                    )
+                }))
+                .child(note(match (probing, supported) {
+                    (Some((_, done, total)), _) => format!("Asking the module… {done} of {total} (read-only)"),
+                    (None, Some(set)) => format!("The module answered {} identifier(s); their values are shown.", set.len()),
+                    (None, None) => "Asks the module about each listed identifier (read-only) and keeps the ones it has. A minute or two for the PCM.".into(),
+                })),
+        );
+        let only: Option<&BTreeSet<u16>> = supported.filter(|_| !self.param_all);
+        let query = self.param_query.clone();
+        let matches: Vec<&params::Param> = all
+            .iter()
+            .filter(|p| only.is_none_or(|set| set.contains(&p.did)))
+            .filter(|p| query.is_empty() || p.name.to_lowercase().contains(&query))
+            .collect();
+        page = page.child(note(format!(
+            "{} of {} {} for {:03X}{}",
+            matches.len().min(SHOWN),
+            only.map_or(all.len(), |_| matches.len()),
+            if only.is_some() { "the module has" } else { "parameters" },
+            selected,
+            if matches.len() > SHOWN { format!(" (first {SHOWN} of {} matches: narrow the search)", matches.len()) } else { String::new() }
+        )));
+        for p in matches.into_iter().take(SHOWN) {
+            let did = p.did;
+            let answer = match self.param_values.get(&(selected, did)) {
+                None => None,
+                Some(Ok(data)) => Some((p.show(data), theme.foreground)),
+                Some(Err(why)) => Some((why.clone(), theme.muted_foreground)),
+            };
+            page = page.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .text_xs()
+                    .child(div().w(px(70.)).text_color(theme.muted_foreground).child(format!("{did:04X}")))
+                    .child(div().w(px(380.)).text_color(theme.foreground).child(p.name.clone()))
+                    .child(Button::new(SharedString::from(format!("rd-{selected}-{did}-{}", p.bit))).label("Read").on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            let _ = this.backend.cmds.send(Cmd::ReadDid { tx_id: selected, did });
+                            cx.notify();
+                        },
+                    )))
+                    .children(answer.map(|(text, color)| div().text_color(color).child(text))),
+            );
+        }
+        page
+    }
+
+    /// Functions FORScan knows for the modules found on this car, read from the user's own import.
+    fn render_functions(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let note = |text: String| div().text_xs().text_color(theme.muted_foreground).child(text);
+        let known = functions::get();
+        let make = self.make.clone();
+        let mut page = v_flex().id("function-list").p_6().gap_3().size_full().overflow_y_scroll();
+        if known.is_empty() {
+            return page.child(note(
+                "No FORScan import found. Run scripts/forscan_import.py on your own forscan.sqlite with --write, then reopen this page. \
+                 The data stays on this computer."
+                    .into(),
+            ));
+        }
+        if self.modules.is_empty() {
+            return page.child(note("Scan the modules first (Modules page); functions are listed for the modules found.".into()));
+        }
+        page = page.child(note(
+            "Run… starts the routine in the module after you confirm, then asks it for the routine's result and its trouble codes. \
+             Routines that take an option record send it as listed (the option value as big-endian bytes). The rest are shown only. \
+             Functions that need security access will be refused until that is supported."
+                .into(),
+        ));
+        for m in &self.modules {
+            let title = self
+                .own_module_name(m.tx_id)
+                .map(String::from)
+                .or_else(|| modnames::get().name(m.tx_id, make.as_deref()).map(String::from))
+                .unwrap_or_else(|| "Module".to_string());
+            let list = known.for_module(m.tx_id);
+            page = page.child(
+                v_flex()
+                    .gap_1()
+                    .p_3()
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(theme.radius)
+                    .child(div().text_sm().text_color(theme.foreground).child(format!("{title}  ·  {:03X}", m.tx_id)))
+                    .when(list.is_empty(), |this| this.child(note("No functions in the import for this module.".into())))
+                    .children(list.iter().enumerate().map(|(i, f)| {
+                        let tx_id = m.tx_id;
+                        let mut detail = Vec::new();
+                        if !f.routine.is_empty() {
+                            detail.push(format!("routine {}", f.routine.to_uppercase()));
+                        }
+                        if !f.reads.is_empty() {
+                            detail.push(format!("reads {}", f.reads));
+                        }
+                        if !f.writes.is_empty() {
+                            detail.push(format!("writes {}", f.writes));
+                        }
+                        if f.needs_security() {
+                            detail.push(format!("needs security access {}: expect a refusal", f.security.to_uppercase()));
+                        }
+                        let confirming = self.confirm_run == Some((tx_id, i));
+                        let routine = f.routine_id();
+                        let (session, title) = (f.session, f.title.clone());
+                        let mode = match f.engine_mode {
+                            Some(1) => " Ignition on, engine OFF.",
+                            Some(2) => " Engine RUNNING.",
+                            _ => "",
+                        };
+                        let result = routine.and_then(|r| self.run_results.get(&(tx_id, r)));
+                        let option = f.option.clone();
+                        let option_text = option.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .text_xs()
+                                    .child(div().w(px(300.)).text_color(theme.foreground).child(f.title.clone()))
+                                    .child(div().text_color(theme.muted_foreground).child(detail.join(" · ")))
+                                    .when(f.runnable && routine.is_some() && !confirming, |this| {
+                                        this.child(Button::new(SharedString::from(format!("run-{tx_id}-{i}"))).label("Run…").on_click(cx.listener(
+                                            move |this, _, _, cx| {
+                                                this.confirm_run = Some((tx_id, i));
+                                                cx.notify();
+                                            },
+                                        )))
+                                    })
+                                    .when(!f.runnable, |this| {
+                                        this.child(div().text_color(theme.muted_foreground).child("display only: needs input FORScan builds itself"))
+                                    }),
+                            )
+                            .when(confirming, |this| {
+                                this.child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .text_xs()
+                                        .child(div().text_color(theme.red).child(format!(
+                                            "Start \"{title}\" on module {tx_id:03X}? This sends routine {:04X}{} and acts on the car: it may change what is stored in it.{mode}",
+                                            routine.unwrap_or(0),
+                                            if option_text.is_empty() { String::new() } else { format!(" with option {option_text}") }
+                                        )))
+                                        .child(Button::new(SharedString::from(format!("go-{tx_id}-{i}"))).label("Start").on_click(cx.listener(
+                                            move |this, _, _, cx| {
+                                                this.confirm_run = None;
+                                                if let Some(routine) = routine {
+                                                    this.run_results.remove(&(tx_id, routine));
+                                                    let _ = this.backend.cmds.send(Cmd::RunRoutine { tx_id, routine, session, option: option.clone() });
+                                                }
+                                                cx.notify();
+                                            },
+                                        )))
+                                        .child(Button::new(SharedString::from(format!("no-{tx_id}-{i}"))).label("Cancel").on_click(cx.listener(
+                                            |this, _, _, cx| {
+                                                this.confirm_run = None;
+                                                cx.notify();
+                                            },
+                                        ))),
+                                )
+                            })
+                            .children(result.map(|(r, after)| {
+                                let (text, color) = match r {
+                                    Ok(bytes) if bytes.is_empty() => ("started: the module accepted the start request (that is not proof it finished)".to_string(), theme.green),
+                                    Ok(bytes) => (
+                                        format!(
+                                            "started: {} (accepted the start request; that is not proof it finished)",
+                                            bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
+                                        ),
+                                        theme.green,
+                                    ),
+                                    Err(why) => (why.clone(), theme.yellow),
+                                };
+                                v_flex()
+                                    .child(div().text_xs().text_color(color).child(text))
+                                    .when(!after.is_empty(), |this| this.child(div().text_xs().text_color(theme.muted_foreground).child(after.clone())))
+                            }))
+                    })),
+            );
+        }
+        page
     }
 
     fn module_card(&self, m: &ModuleView, make: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
@@ -1612,6 +1935,8 @@ impl Render for Diagnostics {
                             Page::Live => this.child(self.render_live(cx)),
                             Page::Readiness => this.child(self.render_readiness_page(cx)),
                             Page::Modules => this.child(self.render_modules(cx)),
+                            Page::Functions => this.child(self.render_functions(cx)),
+                            Page::ModuleData => this.child(self.render_module_data(window, cx)),
                             Page::Contribute => this.child(self.render_contribute(window, cx)),
                             Page::Vehicles => this.child(self.render_vehicles(cx)),
                         },

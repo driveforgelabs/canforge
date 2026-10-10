@@ -47,8 +47,15 @@ monitors, clearing codes (with confirmation), and module discovery (UDS): scan t
 their identification, trouble codes and supported services, and list their readable data identifiers (F100–F1FF).
 The **Help improve** tab lets you name modules and describe trouble codes the database lacks (saved on your computer,
 used immediately, exportable for a vehicle-db pull request with `tools/merge.py`).
-Discovery is read-only: it only ever sends TesterPresent, read-DTC, read-data and default-session requests. Replay accepts CSV data logs and CAN captures
+Discovery is read-only: it only ever sends TesterPresent, read-DTC, read-data and default-session requests. The **Functions** page is the exception: after you confirm, **Run…** opens the function's diagnostic session and starts its UDS routine (0x10, 0x31), which acts on the car. Only routines that need no input of their own can run. Replay accepts CSV data logs and CAN captures
 (`candump -L`, Vector ASC, `candriver monitor`). See `THIRD_PARTY_NOTICES.md` for the DTC data.
+
+### FORScan import (local only)
+
+`scripts/forscan_import.py <forscan.sqlite> --write` reads your own copy of a FORScan database and writes module names,
+functions, readable parameters and trouble code wording into your data directory (`modules.d/`, `forscan/`, `dtc.d/`). The
+**Module data** page lists a module's parameters, asks the module which of them it has, and reads them on request. Nothing
+from FORScan is bundled, uploaded or exported, and it must not be copied into vehicle-db (see its LEGAL.md).
 
 ### Trouble code data
 
