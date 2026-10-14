@@ -33,7 +33,15 @@ pub enum Cmd {
     /// Start a UDS routine (0x31 0x01) after optionally opening a diagnostic session (0x10).
     /// This acts on the car: the UI asks the user to confirm first.
     /// `option` is the routine's option record, sent after the routine ID.
-    RunRoutine { tx_id: u32, routine: u16, session: Option<u8>, option: Vec<u8> },
+    /// `backup` lists data identifiers to read first and report as [`Event::Backup`], so the values
+    /// can be put back if the routine goes wrong.
+    RunRoutine { tx_id: u32, routine: u16, session: Option<u8>, option: Vec<u8>, backup: Vec<u16> },
+    /// Write data identifiers back (UDS 0x2E) in the extended session: a restore of a backup.
+    WriteDids { tx_id: u32, values: Vec<(u16, Vec<u8>)> },
+    /// Read the engine ECU's own self-test results (OBD mode 06). Read-only.
+    ReadMonitors,
+    /// Drop the adapter connection and connect again.
+    Reconnect,
     /// Ask one module which routine identifiers (0x0000–0xFFFF) exist. Starts none; slow.
     /// (request ID, first routine ID) of every module to sweep, all at once.
     SweepRoutines { targets: Vec<(u32, u16)> },
@@ -101,7 +109,7 @@ pub struct FreezeFrame {
 pub enum Event {
     /// Not connected; the string says why. The worker keeps retrying.
     Offline(String),
-    Connected { adapter: String, ecu: Option<u32>, channels: Vec<Channel> },
+    Connected { adapter: String, ecu: Option<u32>, bitrate: Option<u32>, channels: Vec<Channel> },
     Reading { key: String, value: f64 },
     Dtcs { mil_on: bool, codes: Vec<DtcEntry> },
     /// Sweep progress: probes answered per second, fraction of all work done, and the slowest module.
@@ -123,6 +131,12 @@ pub enum Event {
     /// The module's answer to a [`Cmd::RunRoutine`]: the status bytes after the routine ID, or why not.
     /// `after` is what was asked of the module afterwards: the routine's result and its trouble codes.
     RoutineRun { tx_id: u32, routine: u16, result: Result<Vec<u8>, String>, after: String },
+    /// The values read just before a routine started (data identifier, bytes).
+    Backup { tx_id: u32, routine: u16, values: Vec<(u16, Vec<u8>)> },
+    /// What a restore wrote, per data identifier.
+    Restored { tx_id: u32, results: Vec<(u16, Result<String, String>)> },
+    /// Mode 06 self-test results.
+    Monitors(Vec<crate::monitors::Test>),
     /// Outcome of a user action, to show in the UI.
     Notice(String),
 }
@@ -214,7 +228,7 @@ fn run_simulated(tx: &Sender<Event>, rx: &Receiver<Cmd>) {
         tx.send(Event::Dtcs { mil_on: !codes.is_empty(), codes: list }).is_ok()
     };
     let channels = pids.iter().filter_map(|p| obd_channel(*p)).collect();
-    if tx.send(Event::Connected { adapter: "Simulator".into(), ecu: Some(0x7e8), channels }).is_err()
+    if tx.send(Event::Connected { adapter: "Simulator".into(), ecu: Some(0x7e8), bitrate: None, channels }).is_err()
         || tx.send(Event::Vehicle { vin: "WF0SIMULATED00000".into() }).is_err()
         || tx.send(Event::Readiness(readiness::decode(&[0x83, 0x0f, 0xc1, 0x40]).expect("static"))).is_err()
         || tx
@@ -264,12 +278,39 @@ fn run_simulated(tx: &Sender<Event>, rx: &Receiver<Cmd>) {
                     return;
                 }
             }
-            Ok(Cmd::RunRoutine { tx_id, routine, .. }) => {
+            Ok(Cmd::RunRoutine { tx_id, routine, backup, .. }) => {
+                let values: Vec<(u16, Vec<u8>)> = backup.into_iter().take(4).map(|d| (d, vec![0x1f, 0x40])).collect();
+                if !values.is_empty() && tx.send(Event::Backup { tx_id, routine, values }).is_err() {
+                    return;
+                }
+                crate::trace::push(format!("UDS TX {tx_id:X} [04, 31, 01, {:02X}, {:02X}]", routine >> 8, routine & 0xff));
+                crate::trace::push(format!("UDS RX {:X} [04, 71, 01, {:02X}, {:02X}]", tx_id + 8, routine >> 8, routine & 0xff));
                 if tx.send(Event::RoutineRun { tx_id, routine, result: Ok(Vec::new()), after: "simulated".into() }).is_err() {
                     return;
                 }
             }
+            Ok(Cmd::WriteDids { tx_id, values }) => {
+                let results = values.into_iter().map(|(d, _)| (d, Ok("written (simulated)".to_string()))).collect();
+                if tx.send(Event::Restored { tx_id, results }).is_err() {
+                    return;
+                }
+            }
+            Ok(Cmd::ReadMonitors) => {
+                use crate::monitors::Test;
+                let t = |mid, tid, value, min, max| Test { mid, tid, uasid: 0x01, value, min, max };
+                let tests = vec![t(0x21, 0x01, 640, 0, 1000), t(0x01, 0x07, 90, 0, 100), t(0xa1, 0x0b, 0, 0, 10), t(0xa2, 0x0c, 3, 0, 10), t(0x3d, 0x01, 15, 20, 255)];
+                if tx.send(Event::Monitors(tests)).is_err() {
+                    return;
+                }
+            }
+            Ok(Cmd::Reconnect) => {
+                if tx.send(Event::Notice("The simulator has no adapter to reconnect.".into())).is_err() {
+                    return;
+                }
+            }
             Ok(Cmd::ReadDid { tx_id, did }) => {
+                crate::trace::push(format!("UDS TX {tx_id:X} [03, 22, {:02X}, {:02X}]", did >> 8, did & 0xff));
+                crate::trace::push(format!("UDS RX {:X} [05, 62, {:02X}, {:02X}, 1F, 40]", tx_id + 8, did >> 8, did & 0xff));
                 if tx.send(Event::DidValue { tx_id, did, result: Ok(vec![0x1f, 0x40]) }).is_err() {
                     return;
                 }
@@ -297,7 +338,7 @@ fn run_simulated(tx: &Sender<Event>, rx: &Receiver<Cmd>) {
 /// Plays a recorded session back in real time (scaled by `speed`), looping at the end.
 fn run_replay(session: &Session, speed: f64, tx: &Sender<Event>, rx: &Receiver<Cmd>) {
     let adapter = format!("Replay · {}", session.source);
-    if tx.send(Event::Connected { adapter, ecu: None, channels: session.channels.clone() }).is_err() {
+    if tx.send(Event::Connected { adapter, ecu: None, bitrate: None, channels: session.channels.clone() }).is_err() {
         return;
     }
     let notice = |text: &str| tx.send(Event::Notice(text.into())).is_ok();
@@ -309,7 +350,8 @@ fn run_replay(session: &Session, speed: f64, tx: &Sender<Event>, rx: &Receiver<C
                 let wait = due.saturating_sub(start.elapsed());
                 match rx.recv_timeout(wait) {
                     Ok(Cmd::ClearDtcs) if !notice("A replay is read-only: nothing was cleared.") => return,
-                    Ok(Cmd::ScanModules | Cmd::SweepDids { .. } | Cmd::ReadDid { .. } | Cmd::ProbeDids { .. } | Cmd::RunRoutine { .. } | Cmd::ReadVin | Cmd::SweepRoutines { .. }) if !notice("Module scans need a vehicle, not a replay.") => return,
+                    Ok(Cmd::ReadDtcs) if !notice("A replay has no trouble codes to read.") => return,
+                    Ok(Cmd::ScanModules | Cmd::SweepDids { .. } | Cmd::ReadDid { .. } | Cmd::ProbeDids { .. } | Cmd::RunRoutine { .. } | Cmd::WriteDids { .. } | Cmd::ReadMonitors | Cmd::ReadVin | Cmd::SweepRoutines { .. }) if !notice("Module scans need a vehicle, not a replay.") => return,
                     Ok(_) => continue,
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => return,
@@ -344,6 +386,7 @@ fn run_real(tx: &Sender<Event>, rx: &Receiver<Cmd>, bitrate: u32) {
         let deadline = std::time::Instant::now() + RETRY;
         loop {
             match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                Ok(Cmd::Reconnect) => break,
                 Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -358,6 +401,7 @@ struct VehicleLink {
     adapter: String,
     ecu: u32,
     pids: Vec<u8>,
+    bitrate: u32,
 }
 
 fn connect(bitrate: u32) -> Result<VehicleLink, String> {
@@ -378,7 +422,7 @@ fn connect(bitrate: u32) -> Result<VehicleLink, String> {
         // the lowest response ID is the engine ECU (7E8)
         if let Some((ecu, pids)) = supported.into_iter().next() {
             let pids = pids.into_iter().filter(|p| pid::info(*p).is_some()).collect();
-            return Ok(VehicleLink { bus, addressing, adapter: adapter.description, ecu, pids });
+            return Ok(VehicleLink { bus, addressing, adapter: adapter.description, ecu, pids, bitrate });
         }
     }
     Err(format!("No ECU answered at {bitrate} bit/s: ignition on, right bitrate?"))
@@ -418,7 +462,7 @@ impl VehicleLink {
         let mut client = ObdClient::new(self.bus.as_ref(), self.addressing);
         client.timeout = Duration::from_millis(300);
         let channels = self.pids.iter().filter_map(|p| obd_channel(*p)).collect();
-        let up = tx.send(Event::Connected { adapter: self.adapter.clone(), ecu: Some(self.ecu), channels });
+        let up = tx.send(Event::Connected { adapter: self.adapter.clone(), ecu: Some(self.ecu), bitrate: Some(self.bitrate), channels });
         if up.is_err() {
             return Ok(());
         }
@@ -518,9 +562,46 @@ impl VehicleLink {
                             return Ok(());
                         }
                     }
-                    Cmd::RunRoutine { tx_id, routine, session, option } => {
+                    Cmd::Reconnect => return Err("Reconnecting as asked".into()),
+                    Cmd::ReadMonitors => {
+                        let tests = self.read_monitors(&client).map_err(|e| e.to_string())?;
+                        if tx.send(Event::Monitors(tests)).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Cmd::WriteDids { tx_id, values } => {
                         let mut client = UdsClient::new(self.bus.as_ref(), tx_id, tx_id + 8);
                         client.timeout = Duration::from_millis(500);
+                        let results = write_dids(&client, &values);
+                        if tx.send(Event::Restored { tx_id, results }).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Cmd::RunRoutine { tx_id, routine, session, option, backup } => {
+                        let mut client = UdsClient::new(self.bus.as_ref(), tx_id, tx_id + 8);
+                        client.timeout = Duration::from_millis(500);
+                        if !backup.is_empty() {
+                            let mut values = Vec::new();
+                            let mut silent = 0;
+                            for did in backup.into_iter().take(256) {
+                                match client.read_did(did) {
+                                    Ok(Some(DidResult::Data(d))) => {
+                                        silent = 0;
+                                        values.push((did, d));
+                                    }
+                                    Ok(None) => {
+                                        silent += 1;
+                                        if silent >= 5 {
+                                            break;
+                                        }
+                                    }
+                                    _ => silent = 0,
+                                }
+                            }
+                            if tx.send(Event::Backup { tx_id, routine, values }).is_err() {
+                                return Ok(());
+                            }
+                        }
                         let (result, after) = run_routine(&client, routine, session, &option);
                         if tx.send(Event::RoutineRun { tx_id, routine, result, after }).is_err() {
                             return Ok(());
@@ -607,6 +688,28 @@ impl VehicleLink {
                 return Err("The ECU stopped answering".into());
             }
         }
+    }
+
+    /// The engine ECU's self-test results: every monitor it lists, then each monitor's tests.
+    fn read_monitors(&self, client: &ObdClient) -> Result<Vec<crate::monitors::Test>, candriver_obd::Error> {
+        let mut mids = Vec::new();
+        let mut base = 0u8;
+        loop {
+            let Some(answer) = client.request_from(self.ecu, &[0x06, base])? else { break };
+            let (ids, more) = crate::monitors::supported(&answer);
+            mids.extend(ids);
+            if !more || base >= 0xe0 {
+                break;
+            }
+            base += 0x20;
+        }
+        let mut tests = Vec::new();
+        for mid in mids {
+            if let Some(answer) = client.request_from(self.ecu, &[0x06, mid])? {
+                tests.extend(crate::monitors::parse(&answer));
+            }
+        }
+        Ok(tests)
     }
 
     /// Returns `Ok(false)` if the UI is gone.
@@ -808,6 +911,50 @@ fn run_routine(client: &UdsClient, routine: u16, session: Option<u8>, option: &[
         Err(e) => format!("trouble code request failed: {e}"),
     };
     (started, format!("{result}; {codes}"))
+}
+
+/// Puts saved values back (0x2E): reads each identifier first and writes only those that differ,
+/// after opening the extended session. A module often refuses a write without security access;
+/// each result says what it answered.
+fn write_dids(client: &UdsClient, values: &[(u16, Vec<u8>)]) -> Vec<(u16, Result<String, String>)> {
+    let now: Vec<(u16, Vec<u8>)> = values
+        .iter()
+        .filter_map(|(did, _)| match client.read_did(*did) {
+            Ok(Some(DidResult::Data(d))) => Some((*did, d)),
+            _ => None,
+        })
+        .collect();
+    let to_write = crate::backup::changed(values, &now);
+    let opened = if to_write.is_empty() {
+        Ok(())
+    } else {
+        match client.request(&[0x10, 0x03]) {
+            Ok(Some(Response::Positive(_))) => Ok(()),
+            Ok(Some(Response::Negative(nrc))) => Err(format!("session refused: {}", nrc_name(nrc))),
+            Ok(None) => Err("no answer when opening the session".to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    values
+        .iter()
+        .map(|(did, _)| {
+            let Some((_, data)) = to_write.iter().find(|(d, _)| d == did) else {
+                return (*did, Ok("already the saved value".to_string()));
+            };
+            if let Err(e) = &opened {
+                return (*did, Err(e.clone()));
+            }
+            let mut request = vec![0x2e, (did >> 8) as u8, (did & 0xff) as u8];
+            request.extend_from_slice(data);
+            let result = match client.request(&request) {
+                Ok(Some(Response::Positive(_))) => Ok("restored".to_string()),
+                Ok(Some(Response::Negative(nrc))) => Err(format!("refused: {} (code {nrc:02X})", nrc_name(nrc))),
+                Ok(None) => Err("no answer".to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            (*did, result)
+        })
+        .collect()
 }
 
 fn did_lines(found: Vec<(u16, DidFinding)>) -> Vec<DidLine> {

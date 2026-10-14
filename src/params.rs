@@ -23,7 +23,17 @@ pub struct Param {
 }
 
 impl Param {
+    /// The scaled number (or the bit as 0/1), for charts and cards.
+    pub fn value(&self, data: &[u8]) -> Option<f64> {
+        if data.is_empty() {
+            return None;
+        }
+        let raw = data[..data.len().min(8)].iter().fold(0u64, |acc, b| (acc << 8) | *b as u64);
+        Some(if self.is_bit { ((raw >> self.bit.min(63)) & 1) as f64 } else { raw as f64 * self.mult / self.div + self.offset })
+    }
+
     /// The answer as text: the scaled value, or the bit, with the raw bytes always shown.
+    #[cfg(test)]
     pub fn show(&self, data: &[u8]) -> String {
         let raw_hex: String = data.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
         if data.is_empty() {
@@ -41,6 +51,7 @@ impl Param {
     }
 }
 
+#[cfg(test)]
 fn trim(v: f64) -> String {
     let s = format!("{v:.3}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
@@ -89,6 +100,7 @@ impl Params {
         Self { by_module }
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.by_module.is_empty()
     }

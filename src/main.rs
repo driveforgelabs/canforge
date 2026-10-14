@@ -1,20 +1,47 @@
 mod backend;
+mod monitors;
+mod trace;
+mod backup;
+mod checks;
+mod dashboard;
 mod contribute;
 mod dbcmd;
 mod dump;
 mod dtcdb;
 mod functions;
 mod garage;
+mod health;
+mod history;
+mod i18n;
 mod import;
 mod modnames;
 mod params;
+mod pdf;
+mod procedures;
+mod report;
 mod session;
 mod sim;
 mod vin;
+mod codes;
+mod fnpage;
+mod histpage;
+mod live;
+mod modpage;
+mod notes;
+mod procpage;
+mod readiness;
+mod overview;
+mod shell;
+mod tracepage;
+mod units;
+mod verify;
+mod ui;
+mod workshop;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
+use workshop::{OpenPalette, Workshop};
 use backend::{Backend, Cmd, DidLine, DtcEntry, Event, FreezeFrame, ModuleView, RoutineScan};
 use session::Channel;
 use candriver_obd::readiness::Readiness;
@@ -22,12 +49,13 @@ use candriver_obd::pid;
 use gpui_kit::component::{
     ActiveTheme, Icon, IconName, Sizable, Theme, ThemeMode, TitleBar,
     button::{Button, ButtonVariants as _},
-    chart::AreaChart,
+    Size,
+    chart::{AreaChart, LineChart},
     h_flex,
-    progress::Progress,
-    input::{Input, InputState},
+    slider::{Slider, SliderEvent, SliderState},
+    input::{Input, InputEvent, InputState},
     select::{Select, SelectEvent, SelectState},
-    table::{Column, DataTable, TableDelegate, TableState},
+    table::{Column, TableDelegate, TableState},
     v_flex,
 };
 use gpui_kit::base::Disableable as _;
@@ -37,13 +65,27 @@ use gpui_kit::{prelude::FluentBuilder as _, *};
 const PUMP: Duration = Duration::from_millis(50);
 /// Chart history resolution.
 const TICK: Duration = Duration::from_millis(250);
-const HISTORY: usize = 120;
+/// Samples kept per charted signal (5 minutes).
+const SERIES_MAX: usize = 1200;
+
+/// A dashboard widget being dragged (its index), and the label that follows the pointer.
+struct DragWidget(usize);
+
+struct DragPreview {
+    label: String,
+}
+
+impl Render for DragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div().px_3().py_2().rounded(theme.radius).bg(theme.primary).text_color(theme.primary_foreground).child(self.label.clone())
+    }
+}
 
 #[derive(Clone)]
-struct Sample {
-    time: String,
-    /// One value per entry of `Diagnostics::chart_keys`.
-    values: Vec<f64>,
+struct Pt {
+    t: String,
+    v: f64,
 }
 
 struct DtcDelegate {
@@ -112,26 +154,81 @@ enum Page {
     Readiness,
     Modules,
     Functions,
-    ModuleData,
     Contribute,
     Vehicles,
+    Procedures,
+    History,
+    Trace,
+}
+
+/// Development only (`CANFORGE_DEV=1`, set by scripts/dev.sh): remember the open page across the
+/// restarts hot reload does, so a rebuild lands back where the edit is being looked at.
+fn dev_page_file() -> Option<std::path::PathBuf> {
+    std::env::var_os("CANFORGE_DEV").and_then(|_| dtcdb::data_dir()).map(|d| d.join("dev-page"))
 }
 
 impl Page {
-    const ALL: [Page; 8] = [Page::Overview, Page::Codes, Page::Live, Page::Readiness, Page::Modules, Page::Functions, Page::ModuleData, Page::Contribute];
+    const ALL: [Page; 11] = [
+        Page::Overview,
+        Page::Codes,
+        Page::Live,
+        Page::Readiness,
+        Page::Modules,
+        Page::Functions,
+        Page::Contribute,
+        Page::Vehicles,
+        Page::Procedures,
+        Page::History,
+        Page::Trace,
+    ];
+
+    fn dev_restore() -> Page {
+        dev_page_file()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .and_then(|t| t.trim().parse::<usize>().ok())
+            .and_then(|i| Page::ALL.get(i).copied())
+            .unwrap_or(Page::Overview)
+    }
+
+    fn dev_save(self) {
+        static LAST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+        let Some(file) = dev_page_file() else { return };
+        let ix = Page::ALL.iter().position(|p| *p == self).unwrap_or(0);
+        if LAST.swap(ix, std::sync::atomic::Ordering::Relaxed) != ix {
+            let _ = std::fs::write(file, ix.to_string());
+        }
+    }
+
+    /// Sidebar sections: everyday diagnosis first, the rarely needed pages last.
+    fn groups() -> Vec<(&'static str, Vec<Page>)> {
+        let mut advanced = Vec::new();
+        if !functions::get().is_empty() {
+            advanced.push(Page::Functions);
+        }
+        advanced.push(Page::Procedures);
+        advanced.push(Page::Trace);
+        advanced.push(Page::Contribute);
+        vec![
+            ("Diagnose", vec![Page::Overview, Page::Codes, Page::Live, Page::Readiness]),
+            ("Vehicle", vec![Page::Modules, Page::History]),
+            ("Advanced", advanced),
+        ]
+    }
 
     fn label(self) -> &'static str {
-        match self {
+        i18n::tr(match self {
             Page::Overview => "Overview",
             Page::Codes => "Fault codes",
             Page::Live => "Live data",
             Page::Readiness => "Readiness",
             Page::Modules => "Modules",
             Page::Functions => "Functions",
-            Page::ModuleData => "Module data",
             Page::Contribute => "Help improve",
             Page::Vehicles => "Vehicles",
-        }
+            Page::Procedures => "Procedures",
+            Page::History => "History",
+            Page::Trace => "Trace",
+        })
     }
 
     fn icon(self) -> IconName {
@@ -142,9 +239,11 @@ impl Page {
             Page::Readiness => IconName::CircleCheck,
             Page::Modules => IconName::Cpu,
             Page::Functions => IconName::Frame,
-            Page::ModuleData => IconName::ChartPie,
             Page::Contribute => IconName::BookOpen,
             Page::Vehicles => IconName::Frame,
+            Page::Procedures => IconName::BookOpen,
+            Page::History => IconName::Folder,
+            Page::Trace => IconName::Search,
         }
     }
 }
@@ -161,10 +260,16 @@ struct Diagnostics {
     page: Page,
     /// What the source provides, in display order.
     channels: Vec<Channel>,
-    /// Channels drawn as history charts (at most two).
-    chart_keys: Vec<String>,
     readings: BTreeMap<String, f64>,
-    history: VecDeque<Sample>,
+    /// What is on the Live data dashboard, and the recent values of each charted or carded signal.
+    widgets: Vec<dashboard::Widget>,
+    series: BTreeMap<String, VecDeque<f64>>,
+    /// The dashboard is being edited (each widget shows its settings).
+    editing: bool,
+    /// The add-to-dashboard picker is open.
+    picker: bool,
+    /// The user changed the dashboard, so it is not the automatic default any more.
+    dashboard_custom: bool,
     ticks: usize,
     last_sample: std::time::Instant,
     mil_on: bool,
@@ -215,21 +320,48 @@ struct Diagnostics {
     /// Data identifiers found per module request ID.
     dids: BTreeMap<u32, Vec<DidLine>>,
     /// Module data page: the module shown, the filter applied, and what each Read returned.
-    param_module: Option<u32>,
-    param_query: String,
+    /// The picker lists this module's values; `None` is the engine's own live data.
+    picker_tab: Option<u32>,
+    /// Functions page: the module shown and the groups opened.
+    fn_module: Option<u32>,
+    open_groups: BTreeSet<String>,
+    last_poll: std::time::Instant,
     param_values: BTreeMap<(u32, u16), Result<Vec<u8>, String>>,
     /// Identifiers each module answered to during a probe, and the probe in progress (module, done, total).
     param_supported: BTreeMap<u32, BTreeSet<u16>>,
-    param_all: bool,
+    picker_supported_only: bool,
     probe: Option<(u32, usize, usize)>,
     /// Functions page: the run awaiting confirmation (module, index in its list) and what each run returned.
     confirm_run: Option<(u32, usize)>,
     run_results: BTreeMap<(u32, u16), (Result<Vec<u8>, String>, String)>,
     codes: Entity<TableState<DtcDelegate>>,
+    /// A module scan is running (cleared when its result arrives).
+    scanning: bool,
+    /// A trouble code read is running.
+    reading_codes: bool,
+    /// How many times the adapter has been reported offline since the last connection.
+    offline_attempts: usize,
+    /// Live data page: display frozen at the moment Pause was pressed.
+    paused: Option<BTreeMap<String, f64>>,
+    /// Lowest and highest value seen per channel since connecting (or since Reset).
+    extremes: BTreeMap<String, (f64, f64)>,
+    /// Rows being recorded: seconds since start and one value per channel (NaN = no reading yet).
+    recording: Option<(std::time::Instant, Vec<(f64, Vec<f64>)>)>,
+    /// Modules whose full details are open on the Modules page.
+    expanded_modules: BTreeSet<u32>,
+    /// The long export section on the Help improve page is open.
+    show_export: bool,
+    /// How many parameters the Module data page lists.
+    param_limit: usize,
+    ui: ui::UiState,
+    ws: Workshop,
+    /// Short confirmation of the last copy/save, shown in the status bar.
+    toast: Option<String>,
 }
 
 impl Diagnostics {
     fn new(backend: Backend, make: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let (ws, ws_subs) = Workshop::new(window, cx);
         let delegate = DtcDelegate {
             codes: Vec::new(),
             make: make.clone(),
@@ -261,13 +393,21 @@ impl Diagnostics {
             }
         });
 
+        let scrub_state = cx.new(|_| SliderState::new().min(0.).max(60.).step(1.).default_value(60.));
+        let scrub_sub = cx.subscribe(&scrub_state, |this, _, event: &SliderEvent, cx| {
+            if let SliderEvent::Change(v) = event {
+                this.ui.scrub = v.start();
+                cx.notify();
+            }
+        });
+
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(PUMP).await;
                 if this
                     .update_in(cx, |this, window, cx| {
                         // redraw only when something changed
-                        if this.pump(window, cx) {
+                        if this.pump(window, cx) | PATCHED.swap(false, std::sync::atomic::Ordering::Relaxed) {
                             cx.notify();
                         }
                     })
@@ -279,14 +419,17 @@ impl Diagnostics {
         })
         .detach();
 
-        Self {
+        let mut this = Self {
             backend,
             link: Link::Connecting,
-            page: Page::Overview,
+            page: Page::dev_restore(),
             channels: Vec::new(),
-            chart_keys: Vec::new(),
             readings: BTreeMap::new(),
-            history: VecDeque::with_capacity(HISTORY),
+            widgets: dtcdb::data_dir().and_then(|d| dashboard::load(&d)).unwrap_or_default(),
+            series: BTreeMap::new(),
+            editing: false,
+            picker: false,
+            dashboard_custom: dtcdb::data_dir().is_some_and(|d| d.join("dashboard.json").exists()),
             ticks: 0,
             last_sample: std::time::Instant::now(),
             mil_on: false,
@@ -318,18 +461,63 @@ impl Diagnostics {
             inputs: BTreeMap::new(),
             contrib,
             contrib_msg: None,
-            _subscriptions: vec![subscription],
+            _subscriptions: [subscription, scrub_sub].into_iter().chain(ws_subs).collect(),
             modules: Vec::new(),
             dids: BTreeMap::new(),
-            param_module: None,
-            param_query: String::new(),
+            picker_tab: None,
+            fn_module: None,
+            open_groups: BTreeSet::new(),
+            last_poll: std::time::Instant::now(),
             param_values: BTreeMap::new(),
             param_supported: BTreeMap::new(),
-            param_all: false,
+            picker_supported_only: false,
             probe: None,
             confirm_run: None,
             run_results: BTreeMap::new(),
             codes,
+            scanning: false,
+            reading_codes: false,
+            offline_attempts: 0,
+            paused: None,
+            extremes: BTreeMap::new(),
+            recording: None,
+            expanded_modules: BTreeSet::new(),
+            show_export: false,
+            param_limit: 60,
+            ui: ui::UiState::new(scrub_state),
+            ws,
+            toast: None,
+        };
+        this.dev_open();
+        this
+    }
+
+    /// `CANFORGE_OPEN=settings|palette|more|report|run|confirm|bench|detail` opens that overlay at start-up, to look at it.
+    fn dev_open(&mut self) {
+        match std::env::var("CANFORGE_OPEN").as_deref() {
+            Ok("settings") => self.ui.settings = true,
+            Ok("palette") => self.ws.palette_open = true,
+            Ok("more") => self.ui.more = true,
+            Ok("report") => self.ui.report_menu = true,
+            Ok("run") => self.confirm_run = functions::get().for_module(0x7e0).iter().position(|f| f.runnable && f.routine_id().is_some()).map(|i| (0x7e0, i)),
+            Ok("confirm") => self.confirm_clear = true,
+            Ok("bench") => self.ui.bench = true,
+            Ok("detail") => self.ui.detail = true,
+            Ok("fnopen") => {
+                self.fn_module = Some(0x7e0);
+                for f in functions::get().for_module(0x7e0) {
+                    self.open_groups.insert(format!("{:03X}:{}", 0x7e0, f.category()));
+                }
+            }
+            Ok("verify") => {
+                self.ws.clear_result = Some("Cleared 3 of 3 code(s) in the engine ECU. None came back yet. Readiness monitors were reset: drive the car and read the codes again to confirm the repair.".into());
+                self.ws.verify = Some(verify::Verify { at: workshop::unix_now(), codes_before: vec!["P0113".into(), "P0101".into(), "P0300".into()], ready_before: (1, 6), cleared: true, last_read: std::time::Instant::now(), announced: true, dismissed: false });
+            }
+            Ok("procbar") => {
+                self.ws.proc = Some(workshop::ProcRun { index: 1, step: 2, waiting: None, skipped: BTreeSet::new() });
+                self.ui.proc_open = false;
+            }
+            _ => {}
         }
     }
 
@@ -342,15 +530,25 @@ impl Diagnostics {
             match event {
                 Event::Offline(reason) => {
                     self.link = Link::Offline(reason);
+                    self.offline_attempts += 1;
+                    self.scanning = false;
+                    self.reading_codes = false;
                     self.readings.clear();
                 }
-                Event::Connected { adapter, ecu, channels } => {
+                Event::Connected { adapter, ecu, bitrate, channels } => {
+                    self.ws.bitrate = bitrate;
                     self.link = Link::Online { adapter, ecu };
-                    // prefer engine speed and vehicle speed; otherwise the first two channels
-                    let preferred = ["pid:0c", "pid:0d"].map(String::from);
-                    self.chart_keys = preferred.iter().filter(|k| channels.iter().any(|c| &c.key == *k)).cloned().collect();
-                    if self.chart_keys.is_empty() {
-                        self.chart_keys = channels.iter().take(2).map(|c| c.key.clone()).collect();
+                    self.offline_attempts = 0;
+                    self.paused = None;
+                    self.extremes.clear();
+                    // a saved dashboard that fits nothing this source provides is replaced by the default
+                    let fits = self.widgets.iter().any(|w| match &w.sig {
+                        dashboard::Sig::Obd(k) => channels.iter().any(|c| &c.key == k),
+                        dashboard::Sig::Param { .. } => true,
+                    });
+                    if !fits {
+                        let keys: Vec<String> = channels.iter().map(|c| c.key.clone()).collect();
+                        self.widgets = dashboard::defaults(&keys);
                     }
                     self.channels = channels;
                     self.scan_requested = false;
@@ -358,14 +556,25 @@ impl Diagnostics {
                     self.ensure_modules();
                     self.ensure_vin();
                     self.readings.clear();
-                    self.history.clear();
+                    self.series.clear();
                     self.ticks = 0;
                 }
                 Event::Reading { key, value } => {
+                    let e = self.extremes.entry(key.clone()).or_insert((value, value));
+                    e.0 = e.0.min(value);
+                    e.1 = e.1.max(value);
                     self.readings.insert(key, value);
                 }
-                Event::Notice(text) => self.notice = Some(text),
+                Event::Notice(text) => {
+                    // a replay refuses reads and scans with a notice and never answers them
+                    if text.contains("replay") || text.contains("need a vehicle") {
+                        self.scanning = false;
+                        self.reading_codes = false;
+                    }
+                    self.notice = Some(text);
+                }
                 Event::Modules(modules) => {
+                    self.scanning = false;
                     // every module reports the VIN: use it if the engine ECU did not
                     if self.vin.is_none() {
                         let vin = modules.iter().flat_map(|m| &m.identity).find(|(k, v)| k == "VIN" && v.len() == 17).map(|(_, v)| v.clone());
@@ -400,6 +609,7 @@ impl Diagnostics {
                         Ok(_) => format!("Module {tx_id:03X}: routine {routine:04X} started."),
                         Err(why) => format!("Module {tx_id:03X}: routine {routine:04X} {why}"),
                     });
+                    self.on_routine_run(tx_id, routine, result.is_ok(), cx);
                     self.run_results.insert((tx_id, routine), (result, after));
                 }
                 Event::Dids { tx_id, lines } => {
@@ -439,30 +649,261 @@ impl Diagnostics {
                     self.notice = None;
                     self.set_vin(vin, window, cx)
                 }
+                Event::Backup { tx_id, routine, values } => self.on_backup(tx_id, routine, values),
+                Event::Restored { tx_id, results } => self.on_restored(tx_id, results, cx),
+                Event::Monitors(tests) => {
+                    self.toast = Some(format!("{} self-test result(s) read.", tests.len()));
+                    self.ws.monitors = Some(tests);
+                }
                 Event::Readiness(r) => self.readiness = Some(r),
                 Event::Freeze(f) => self.freeze = f,
                 Event::Dtcs { mil_on, codes } => {
                     self.mil_on = mil_on;
+                    self.reading_codes = false;
                     self.codes.update(cx, |table, cx| {
                         table.delegate_mut().codes = codes;
                         cx.notify();
                     });
+                    self.finish_clear(cx);
                 }
+            }
+        }
+        changed |= self.sync_history(cx);
+        changed |= self.verify_tick(cx);
+        if self.page == Page::Trace && self.ws.trace_frozen.is_none() && trace::latest() != self.ws.trace_seen {
+            self.ws.trace_seen = trace::latest();
+            changed = true;
+        }
+        // module values on the dashboard are asked for again every second while it is showing
+        if self.page == Page::Live && self.paused.is_none() && matches!(self.link, Link::Online { .. }) && self.last_poll.elapsed() >= Duration::from_secs(1) {
+            self.last_poll = std::time::Instant::now();
+            let wanted: BTreeSet<(u32, u16)> = self
+                .widgets
+                .iter()
+                .filter_map(|w| match w.sig {
+                    dashboard::Sig::Param { tx, did, .. } => Some((tx, did)),
+                    _ => None,
+                })
+                .collect();
+            for (tx_id, did) in wanted {
+                let _ = self.backend.cmds.send(Cmd::ReadDid { tx_id, did });
             }
         }
         if matches!(self.link, Link::Online { .. }) && self.last_sample.elapsed() >= TICK {
             self.last_sample = std::time::Instant::now();
             changed = true;
-            if self.history.len() >= HISTORY {
-                self.history.pop_front();
+            if self.paused.is_none() {
+                for w in self.widgets.clone() {
+                    if let Ok(v) = self.sig_value(&w.sig, &self.readings) {
+                        let q = self.series.entry(w.sig.id()).or_default();
+                        if q.len() >= SERIES_MAX {
+                            q.pop_front();
+                        }
+                        q.push_back(v);
+                    }
+                }
             }
-            self.history.push_back(Sample {
-                time: format!("{:.0}s", self.ticks as f64 * TICK.as_secs_f64()),
-                values: self.chart_keys.iter().map(|k| self.readings.get(k).copied().unwrap_or(0.0)).collect(),
-            });
             self.ticks += 1;
+            if let Some((start, rows)) = &mut self.recording {
+                if rows.len() < 200_000 {
+                    let values = self.channels.iter().map(|c| self.readings.get(&c.key).copied().unwrap_or(f64::NAN)).collect();
+                    rows.push((start.elapsed().as_secs_f64(), values));
+                }
+            }
         }
         changed
+    }
+
+    /// Starts a module scan (read-only) and shows that it is running.
+    fn start_scan(&mut self) {
+        if matches!(self.link, Link::Online { .. }) && !self.scanning {
+            self.scanning = true;
+            self.scan_requested = true;
+            let _ = self.backend.cmds.send(Cmd::ScanModules);
+        }
+    }
+
+    fn start_read_codes(&mut self) {
+        if matches!(self.link, Link::Online { .. }) && !self.reading_codes {
+            self.reading_codes = true;
+            let _ = self.backend.cmds.send(Cmd::ReadDtcs);
+        }
+    }
+
+    fn rpm(&self) -> Option<f64> {
+        self.readings.get("pid:0c").copied()
+    }
+
+    /// Whether the engine is known to be running (`None` when engine speed is not available).
+    fn engine_running(&self) -> Option<bool> {
+        health::engine_running(self.rpm())
+    }
+
+    fn module_title(&self, tx_id: u32) -> String {
+        self.modules
+            .iter()
+            .find(|m| m.tx_id == tx_id)
+            .and_then(|m| m.identity.iter().find(|(k, _)| k == "System name").map(|(_, v)| v.clone()))
+            .or_else(|| self.own_module_name(tx_id).map(String::from))
+            .or_else(|| modnames::get().name(tx_id, self.make.as_deref()).map(String::from))
+            .unwrap_or_else(|| "Module".to_string())
+    }
+
+    /// Every fault the car reported: the engine ECU's OBD list plus what each scanned module holds,
+    /// without listing the same code twice for the same module.
+    fn faults(&self, cx: &App) -> Vec<report::Fault> {
+        let db = dtcdb::get();
+        let make = self.make.as_deref();
+        let describe = |code: &str| {
+            let info = db.lookup(code, make);
+            match (&info.scope, self.own_description(code)) {
+                (dtcdb::Scope::Unknown, Some(own)) => own.to_string(),
+                _ => info.description,
+            }
+        };
+        let mut out: Vec<report::Fault> = Vec::new();
+        let mut seen: BTreeSet<(String, u32)> = BTreeSet::new();
+        for e in self.codes.read(cx).delegate().codes.iter() {
+            let code = e.code.to_string();
+            let tx = e.ecu.saturating_sub(8);
+            seen.insert((code.clone(), tx));
+            out.push(report::Fault { description: describe(&code), module: format!("{} · {tx:03X}", self.module_title(tx)), status: e.kind.to_string(), code });
+        }
+        for m in &self.modules {
+            for d in &m.dtcs {
+                let code = d.code.get(..5).unwrap_or(&d.code).to_string();
+                if !seen.insert((code.clone(), m.tx_id)) {
+                    continue;
+                }
+                out.push(report::Fault {
+                    description: describe(&code),
+                    module: format!("{} · {:03X}", self.module_title(m.tx_id), m.tx_id),
+                    status: d.status.to_string(),
+                    code,
+                });
+            }
+        }
+        // what is urgent first, and the likely root cause before what it set off
+        let weak = self.battery_weak();
+        out.sort_by_key(|f| checks::order_key(&f.code, f.status == "pending", weak));
+        out
+    }
+
+    /// The battery reads bad (flat, or not charging with the engine running).
+    pub fn battery_weak(&self) -> bool {
+        self.readings.get("pid:42").is_some_and(|v| matches!(health::battery(*v, self.rpm()).1, health::Level::Bad))
+    }
+
+    fn battery_text(&self) -> Option<String> {
+        let v = self.readings.get("pid:42").copied()?;
+        Some(format!("{v:.1} V, {}", health::battery(v, self.rpm()).0))
+    }
+
+    fn build_report(&self, cx: &App) -> report::Report {
+        let unix_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let vehicle = self
+            .current
+            .and_then(|ix| self.vehicles.get(ix))
+            .map(|v| v.name.clone())
+            .or_else(|| self.make.clone())
+            .unwrap_or_else(|| "Vehicle".into());
+        let adapter = match &self.link {
+            Link::Online { adapter, .. } => adapter.clone(),
+            _ => String::new(),
+        };
+        report::Report {
+            unix_time,
+            vehicle,
+            vin: self.vin.clone(),
+            adapter,
+            mil_on: self.mil_on,
+            battery: self.battery_text(),
+            faults: self.faults(cx),
+            modules_scanned: !self.modules.is_empty(),
+            readiness: self.readiness.as_ref().map(|r| r.monitors.iter().filter(|m| m.supported).map(|m| (m.name.to_string(), m.complete)).collect()).unwrap_or_default(),
+            freeze: self
+                .freeze
+                .as_ref()
+                .map(|f| f.values.iter().filter_map(|(p, v)| pid::info(*p).map(|i| { let (n, u) = units::show_free(*v, i.unit); (i.name.to_string(), format!("{n} {u}")) })).collect())
+                .unwrap_or_default(),
+            freeze_code: self.freeze.as_ref().map(|f| f.dtc.to_string()),
+            actions: self.ws.actions.clone(),
+            since_last: self.since_last(cx),
+            extra: report::Extra {
+                shop: self.ws.shop_input.read(cx).value().to_string(),
+                note: self.ws.note_input.read(cx).value().to_string(),
+                recommendation: self.ws.reco_input.read(cx).value().to_string(),
+                estimate: self.ws.est_input.read(cx).value().to_string(),
+                checks: self.ws.checks_done.iter().cloned().collect(),
+                photos: self.photo_paths(),
+                repair: self.ws.verify.as_ref().filter(|v| v.cleared).map(|v| report::Repair {
+                    codes_before: v.codes_before.len(),
+                    codes_now: self.obd_codes(cx).len(),
+                    ready_before: v.ready_before,
+                    ready_now: self.monitor_counts(),
+                    came_back: v.codes_before.iter().filter(|c| self.obd_codes(cx).contains(c)).cloned().collect(),
+                }),
+            },
+        }
+    }
+
+    /// Saves the job report, opens it in the default browser for printing, and says where it went.
+    fn save_report(&mut self, cx: &mut Context<Self>) {
+        let report = self.build_report(cx);
+        self.toast = Some(match dtcdb::data_dir() {
+            None => "No data directory available (set CANFORGE_DATA_DIR).".into(),
+            Some(dir) => match report::write(&dir, &report) {
+                Ok(path) => {
+                    let _ = std::process::Command::new("xdg-open").arg(&path).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+                    format!("Report saved: {}. Print it from the browser to get a PDF.", path.display())
+                }
+                Err(e) => e,
+            },
+        });
+        cx.notify();
+    }
+
+    fn copy_text(&mut self, text: String, what: &str, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.toast = Some(format!("Copied {what}."));
+        cx.notify();
+    }
+
+    /// Stops recording and writes the rows as a CSV that `--replay` can play back.
+    fn stop_recording(&mut self, cx: &mut Context<Self>) {
+        let Some((_, rows)) = self.recording.take() else { return };
+        let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        self.toast = Some(match dtcdb::data_dir() {
+            None => "No data directory available (set CANFORGE_DATA_DIR).".into(),
+            Some(dir) => {
+                let mut csv = String::from("Time [s]");
+                for c in &self.channels {
+                    let name = c.name.replace([',', '[', ']'], " ");
+                    if c.unit.is_empty() { csv.push_str(&format!(",{name}")) } else { csv.push_str(&format!(",{name} [{}]", c.unit.replace(',', " "))) }
+                }
+                csv.push('\n');
+                for (t, values) in &rows {
+                    csv.push_str(&format!("{t:.2}"));
+                    for v in values {
+                        if v.is_nan() { csv.push(',') } else { csv.push_str(&format!(",{v}")) }
+                    }
+                    csv.push('\n');
+                }
+                let folder = dir.join("recordings");
+                let path = folder.join(format!("live-{unix}.csv"));
+                if let Some(from) = self.ws.record_trace_from.take() {
+                    let lines = trace::since(from);
+                    if !lines.is_empty() {
+                        let _ = std::fs::create_dir_all(&folder).and_then(|_| std::fs::write(folder.join(format!("live-{unix}.trace.txt")), trace::to_text(&lines)));
+                    }
+                }
+                match std::fs::create_dir_all(&folder).and_then(|_| std::fs::write(&path, csv)) {
+                    Ok(()) => format!("Recording saved ({} rows): {}. Replay it with --replay.", rows.len(), path.display()),
+                    Err(e) => format!("{}: {e}", path.display()),
+                }
+            }
+        });
+        cx.notify();
     }
 
     /// A VIN was read: recognise the vehicle, or add it when the VIN names a make.
@@ -489,12 +930,11 @@ impl Diagnostics {
         }
     }
 
-    /// The Modules and Help improve pages need the module list: scan once per connection.
+    /// Scans the modules once per connection, so faults outside the engine ECU are not missed.
     fn ensure_modules(&mut self) {
-        let wanted = matches!(self.page, Page::Modules | Page::Functions | Page::ModuleData | Page::Contribute);
-        if wanted && !self.scan_requested && self.modules.is_empty() && matches!(self.link, Link::Online { .. }) {
-            self.scan_requested = true;
-            let _ = self.backend.cmds.send(Cmd::ScanModules);
+        // faults in other modules belong on the Overview and Fault codes pages too
+        if !self.scan_requested && self.modules.is_empty() {
+            self.start_scan();
         }
     }
 
@@ -625,6 +1065,12 @@ impl Diagnostics {
     fn start_dump(&mut self, routines: bool, cx: &mut Context<Self>) {
         if !matches!(self.link, Link::Online { .. }) {
             self.contrib_msg = Some("Connect to a vehicle first.".into());
+        } else if routines && self.engine_running() != Some(false) {
+            self.contrib_msg = Some(if self.engine_running().is_some() {
+                "Stop the engine first: the routine scan switches modules into another diagnostic session.".into()
+            } else {
+                "Cannot tell whether the engine is stopped (no engine speed): not starting the routine scan.".into()
+            });
         } else {
             self.dump_pending = true;
             self.dump_routines = routines;
@@ -774,7 +1220,22 @@ impl Diagnostics {
     }
 
     fn input_for(&mut self, key: String, placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
-        self.inputs.entry(key).or_insert_with(|| cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))).clone()
+        if let Some(existing) = self.inputs.get(&key) {
+            return existing.clone();
+        }
+        let state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        if matches!(key.as_str(), "params-search" | "fn-search" | "pick-search") {
+            // filter as the user types
+            let sub = cx.subscribe_in(&state, window, |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.param_limit = 60;
+                    cx.notify();
+                }
+            });
+            self._subscriptions.push(sub);
+        }
+        self.inputs.insert(key, state.clone());
+        state
     }
 
     fn render_contribute(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -814,6 +1275,7 @@ impl Diagnostics {
             rows.push(self.contribute_row(code.clone(), input, contribute::Kind::Dtc, code, cx));
         }
 
+        let show_export = self.show_export;
         v_flex()
             .id("contribute")
             .p_6()
@@ -821,26 +1283,26 @@ impl Diagnostics {
             .size_full()
             .overflow_y_scroll()
             .child(
-                div().text_xs().text_color(theme.muted_foreground).child(
-                    "Name modules and describe codes the shared database does not know yet. Only enter what you worked out \
-                     from your own vehicle: the label on the part, what happens when you use that system. Never copy from \
-                     other diagnostic software. Entries are used immediately and stay on this computer until you export them.",
+                div().text_sm().text_color(theme.muted_foreground).child(
+                    "Name modules and describe codes the shared database does not know yet. Only enter what you found out on \
+                     your own vehicle (the label on the part, what stops working). Never copy from other diagnostic software. \
+                     Entries work immediately and stay on this computer until you export them.",
                 ),
             )
             .child(
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(div().text_xs().w(px(120.)).text_color(theme.muted_foreground).child("This vehicle"))
+                    .child(div().text_sm().w(px(120.)).text_color(theme.muted_foreground).child("This vehicle"))
                     .child(div().flex_1().child(Input::new(&self.note_input))),
             )
-            .child(div().text_xs().text_color(theme.muted_foreground).child(match &make {
+            .child(div().text_sm().text_color(theme.muted_foreground).child(match &make {
                 Some(m) => format!("Make: {m}. Describe the model and engine above, not the VIN."),
-                None => "Choose the vehicle's make first (selector at the bottom right or the banner).".to_string(),
+                None => "Choose the vehicle's make first (the yellow banner or the vehicle card at the top left).".to_string(),
             }))
             .children(rows.is_empty().then(|| {
-                div().text_sm().text_color(theme.muted_foreground).child(if self.modules.is_empty() {
-                    "Scanning the vehicle for modules… (or press Scan modules on the Modules page)."
+                div().text_base().text_color(theme.muted_foreground).child(if self.modules.is_empty() {
+                    "Scanning the vehicle for modules…"
                 } else {
                     "Nothing is missing for the modules and codes found so far."
                 })
@@ -850,21 +1312,38 @@ impl Diagnostics {
                 v_flex()
                     .gap_2()
                     .pt_2()
-                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child("Export everything from this vehicle"))
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(
-                        "Scans every module and reads all its data identifiers, then saves one JSON file with the vehicle, \
-                         parameters, trouble codes, readiness, freeze frame, modules, the services each one accepts and their \
-                         data. Read-only. The routine scan asks each module about every routine ID 0000–FFFF without starting any; it first switches each module to its extended diagnostic session (and back afterwards), can take many minutes and pauses live data meanwhile. The file contains the VIN: it is for your own analysis, not for sharing.",
-                    ))
+                    .child(
+                        h_flex().gap_2().items_center()
+                            .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("Export everything from this vehicle"))
+                            .child(Button::new("export-toggle").ghost().small().label(if show_export { "Hide" } else { "Show" }).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.show_export = !this.show_export;
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .when(show_export, |this| {
+                        this.child(div().text_sm().text_color(theme.muted_foreground).child(
+                            "Saves one JSON file with the vehicle, trouble codes, readiness, freeze frame, modules and the data they \
+                             answer. The file contains the VIN: keep it for your own analysis, do not share it.",
+                        ))
+                        .child(div().text_sm().text_color(theme.yellow).child(
+                            "The routine scan asks every module about every routine ID without starting any, but it switches each \
+                             module into its extended diagnostic session (and back), takes many minutes and pauses live data. \
+                             Engine must be stopped.",
+                        ))
+                    })
                     .child(h_flex().gap_2().child(
                         Button::new("dump").icon(IconName::Folder).label("Export vehicle data").disabled(self.dump_pending).on_click(
                             cx.listener(|this, _, _, cx| this.start_dump(false, cx)),
                         ),
-                    ).child(
-                        Button::new("dump-routines").label(if resumable { "Resume routine scan and export" } else { "Export with routine scan (slow)" }).disabled(self.dump_pending).on_click(
-                            cx.listener(|this, _, _, cx| this.start_dump(true, cx)),
-                        ),
-                    ).when(resumable && !self.dump_pending, |this| {
+                    ).when(show_export, |this| {
+                        this.child(
+                            Button::new("dump-routines").label(if resumable { "Resume routine scan and export" } else { "Export with routine scan (slow)" }).disabled(self.dump_pending).on_click(
+                                cx.listener(|this, _, _, cx| this.start_dump(true, cx)),
+                            ),
+                        )
+                    }).when(resumable && !self.dump_pending && show_export, |this| {
                         this.child(Button::new("dump-restart").label("Start routine scan over").on_click(cx.listener(|this, _, _, cx| {
                             if let Some(dir) = dtcdb::data_dir() {
                                 dump::progress::clear(&dir, &this.scan_key());
@@ -877,7 +1356,7 @@ impl Diagnostics {
                         this.child(Button::new("dump-cancel").label("Stop scan").on_click(cx.listener(|this, _, _, cx| this.cancel_dump_routines(cx))))
                     })),
             )
-            .children(self.contrib_msg.clone().map(|m| div().text_xs().text_color(theme.foreground).child(m)))
+            .children(self.contrib_msg.clone().map(|m| div().text_sm().text_color(theme.foreground).child(m)))
     }
 
     fn contribute_row(&self, label: String, input: Entity<InputState>, kind: contribute::Kind, id: String, cx: &mut Context<Self>) -> AnyElement {
@@ -885,9 +1364,9 @@ impl Diagnostics {
         h_flex()
             .gap_2()
             .items_center()
-            .child(div().w(px(260.)).text_xs().text_color(theme.foreground).child(label))
+            .child(div().w(px(260.)).text_sm().text_color(theme.foreground).child(label))
             .child(div().flex_1().child(Input::new(&input)))
-            .child(Button::new(SharedString::from(format!("save-{id}"))).label("Save").on_click(cx.listener(
+            .child(Button::new(SharedString::from(format!("save-{id}"))).label("Save").with_size(btn()).on_click(cx.listener(
                 move |this, _, window, cx| this.save_contribution(kind, id.clone(), window, cx),
             )))
             .into_any_element()
@@ -897,208 +1376,429 @@ impl Diagnostics {
         self.codes.read(cx).delegate().codes.len()
     }
 
-    fn gauge(&self, info: &Channel, cx: &Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let value = self.readings.get(&info.key).copied();
-        let warn = value.is_some_and(|v| info.warn_above.is_some_and(|w| v > w));
-        let percent = value
-            .map(|v| ((v - info.min) / (info.max - info.min) * 100.0).clamp(0.0, 100.0))
-            .unwrap_or(0.0);
-        v_flex()
-            .gap_1()
-            .p_3()
-            .w(px(200.))
-            .border_1()
-            .border_color(theme.border)
-            .rounded(theme.radius)
-            .child(div().text_xs().text_color(theme.muted_foreground).child(info.name.clone()))
-            .child(
-                h_flex()
-                    .gap_1()
-                    .items_baseline()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .text_color(if warn { theme.red } else { theme.foreground })
-                            .child(match value {
-                                Some(v) => format_value(v, info.max - info.min),
-                                None => "—".into(),
-                            }),
-                    )
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(info.unit.clone())),
-            )
-            .child(Progress::new(SharedString::from(info.key.clone())).h_1().value(percent as f32))
-    }
 
-    fn chart(
-        &self,
-        title: String,
-        index: usize,
-        color: Hsla,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.theme();
-        let data: Vec<Sample> = self.history.iter().cloned().collect();
-        v_flex()
-            .flex_1()
-            .min_h(px(140.))
-            .border_1()
-            .border_color(theme.border)
-            .rounded(theme.radius)
-            .child(div().px_3().py_1().text_sm().text_color(theme.foreground).child(title))
-            .child(
-                AreaChart::new(data)
-                    .x(|s| s.time.clone())
-                    .y(move |s: &Sample| s.values.get(index).copied().unwrap_or(0.0))
-                    .stroke(color)
-                    .fill(linear_gradient(
-                        0.,
-                        linear_color_stop(color.opacity(0.4), 1.),
-                        linear_color_stop(theme.background.opacity(0.1), 0.),
-                    ))
-                    .tick_margin(15),
-            )
-    }
 
-    fn render_live(&self, cx: &Context<Self>) -> impl IntoElement {
-        if self.channels.is_empty() {
-            let msg = match &self.link {
-                Link::Offline(reason) => reason.clone(),
-                _ => "Waiting for the ECU…".into(),
-            };
-            return div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(cx.theme().muted_foreground)
-                .child(msg)
-                .into_any_element();
+
+
+
+    /// Name, unit, range and where a dashboard signal comes from.
+    fn sig_info(&self, sig: &dashboard::Sig) -> Channel {
+        match sig {
+            dashboard::Sig::Obd(key) => match self.channels.iter().find(|c| &c.key == key) {
+                Some(c) => c.clone(),
+                None => Channel::new(key.clone(), key.clone(), ""),
+            },
+            dashboard::Sig::Param { tx, did, bit } => {
+                let p = params::get().for_module(*tx).iter().find(|p| p.did == *did && p.bit == *bit);
+                let mut c = Channel::new(sig.id(), p.map_or(format!("{did:04X}"), |p| p.name.clone()), p.map_or(String::new(), |p| p.unit.clone()));
+                if p.is_some_and(|p| p.is_bit) {
+                    c.max = 1.0;
+                }
+                c
+            }
         }
+    }
+
+    /// Where the signal comes from, for the card's small print.
+    fn sig_source(&self, sig: &dashboard::Sig) -> String {
+        match sig {
+            dashboard::Sig::Obd(_) => "Engine".into(),
+            dashboard::Sig::Param { tx, .. } => format!("{} · {tx:03X}", self.module_title(*tx)),
+        }
+    }
+
+    /// The current number, or why there is none.
+    fn sig_value(&self, sig: &dashboard::Sig, shown: &BTreeMap<String, f64>) -> Result<f64, String> {
+        match sig {
+            dashboard::Sig::Obd(key) => shown.get(key).copied().ok_or_else(|| "no data".to_string()),
+            dashboard::Sig::Param { tx, did, bit } => match self.param_values.get(&(*tx, *did)) {
+                None => Err("waiting for the module…".into()),
+                Some(Err(why)) => Err(why.clone()),
+                Some(Ok(data)) => params::get().for_module(*tx).iter().find(|p| p.did == *did && p.bit == *bit).and_then(|p| p.value(data)).ok_or_else(|| "no value".to_string()),
+            },
+        }
+    }
+
+    fn save_dashboard(&mut self) {
+        self.dashboard_custom = true;
+        if let Some(dir) = dtcdb::data_dir() {
+            if let Err(e) = dashboard::save(&dir, &self.widgets) {
+                self.toast = Some(e);
+            }
+        }
+    }
+
+    /// Puts a signal on the dashboard as a card, or takes it off if it is already there.
+    fn toggle_signal(&mut self, sig: dashboard::Sig) {
+        if self.widgets.iter().any(|w| w.sig == sig) {
+            self.widgets.retain(|w| w.sig != sig);
+        } else {
+            if let dashboard::Sig::Param { tx, did, .. } = sig {
+                let _ = self.backend.cmds.send(Cmd::ReadDid { tx_id: tx, did });
+            }
+            self.widgets.push(dashboard::Widget::card(sig));
+        }
+        self.save_dashboard();
+    }
+
+    fn render_widget(&self, ix: usize, w: &dashboard::Widget, shown: &BTreeMap<String, f64>, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let info = self.sig_info(&w.sig);
+        let value = self.sig_value(&w.sig, shown);
+        let source = self.sig_source(&w.sig);
+        let last = self.widgets.len().saturating_sub(1);
+        let seg = |label: &'static str, view: dashboard::View, cx: &mut Context<Self>| {
+            Button::new(SharedString::from(format!("v{ix}-{label}"))).small().label(label).when(w.view == view, |b| b.primary()).on_click(cx.listener(move |this, _, _, cx| {
+                this.widgets[ix].view = view;
+                this.save_dashboard();
+                cx.notify();
+            }))
+        };
+        let is_chart = w.view != dashboard::View::Card;
+        let ranged = info.max > info.min;
+        let edit_bar = h_flex()
+            .gap_1()
+            .flex_wrap()
+            .items_center()
+            .child(seg("Card", dashboard::View::Card, cx))
+            .child(seg("Line", dashboard::View::Line, cx))
+            .child(seg("Area", dashboard::View::Area, cx))
+            .when(is_chart, |this| {
+                this.child(Button::new(SharedString::from(format!("w{ix}-size"))).small().label(format!("Width: {}", dashboard::SIZES[w.size as usize % 3].0)).on_click(cx.listener(move |this, _, _, cx| {
+                    this.widgets[ix].size = (this.widgets[ix].size + 1) % 3;
+                    this.save_dashboard();
+                    cx.notify();
+                })))
+                .child(Button::new(SharedString::from(format!("w{ix}-win"))).small().label(format!("Last {}", dashboard::WINDOWS[w.window as usize % 4].0)).on_click(cx.listener(move |this, _, _, cx| {
+                    this.widgets[ix].window = (this.widgets[ix].window + 1) % 4;
+                    this.save_dashboard();
+                    cx.notify();
+                })))
+                .when(ranged, |this| {
+                    this.child(Button::new(SharedString::from(format!("w{ix}-axis"))).small().label(if w.lock_range { "Axis: fixed" } else { "Axis: fit data" }).on_click(cx.listener(move |this, _, _, cx| {
+                        this.widgets[ix].lock_range = !this.widgets[ix].lock_range;
+                        this.save_dashboard();
+                        cx.notify();
+                    })))
+                })
+            })
+            .child(Button::new(SharedString::from(format!("w{ix}-left"))).small().label("◀").disabled(ix == 0).on_click(cx.listener(move |this, _, _, cx| {
+                this.widgets.swap(ix, ix - 1);
+                this.save_dashboard();
+                cx.notify();
+            })))
+            .child(Button::new(SharedString::from(format!("w{ix}-right"))).small().label("▶").disabled(ix == last).on_click(cx.listener(move |this, _, _, cx| {
+                this.widgets.swap(ix, ix + 1);
+                this.save_dashboard();
+                cx.notify();
+            })))
+            .child(Button::new(SharedString::from(format!("w{ix}-del"))).small().danger().label("Remove").on_click(cx.listener(move |this, _, _, cx| {
+                this.widgets.remove(ix);
+                this.save_dashboard();
+                cx.notify();
+            })));
+
+        let body = if !is_chart {
+            let note = match &value {
+                Ok(_) => match &w.sig {
+                    dashboard::Sig::Param { tx, did, .. } => {
+                        let raw = self.param_values.get(&(*tx, *did)).and_then(|r| r.as_ref().ok()).map(|d| d.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+                        Some(format!("{source} · raw {raw}"))
+                    }
+                    _ => None,
+                },
+                Err(why) => Some(why.clone()),
+            };
+            let _ = note;
+            self.tile(ix, w, &info, &value, cx)
+        } else {
+            let (_, count) = dashboard::WINDOWS[w.window as usize % 4];
+            let queue = self.series.get(&w.sig.id());
+            let len = queue.map_or(0, |q| q.len());
+            let skip = len.saturating_sub(count);
+            let shown_len = len - skip;
+            let data: Vec<Pt> = queue
+                .map(|q| q.iter().skip(skip).enumerate().map(|(i, v)| Pt { t: format!("-{:.0}s", (shown_len - 1 - i) as f64 * TICK.as_secs_f64()), v: *v }).collect())
+                .unwrap_or_default();
+            let color = [theme.red, theme.blue, theme.green, theme.yellow][ix % 4];
+            let tick = (count / 8).max(2);
+            let span = info.max - info.min;
+            let current = match &value {
+                Ok(v) => format!("{} {}", format_value(*v, if ranged { span } else { 10.0 }), info.unit),
+                Err(why) => why.clone(),
+            };
+            // axis limits and ticks on friendly numbers: 800, 1000, 1200…
+            let (dmin, dmax) = if w.lock_range && ranged {
+                (info.min, info.max)
+            } else {
+                data.iter().fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p.v), hi.max(p.v)))
+            };
+            let (lo, hi, ticks) = health::nice_axis(dmin, dmax);
+            let chart: AnyElement = if data.is_empty() {
+                div().flex_1().flex().items_center().justify_center().text_color(theme.muted_foreground).child("Waiting for data…").into_any_element()
+            } else if w.view == dashboard::View::Line {
+                LineChart::new(data)
+                    .x(|p: &Pt| p.t.clone())
+                    .y(|p: &Pt| p.v)
+                    .stroke(color)
+                    .tick_margin(tick)
+                    .y_domain(lo, hi)
+                    .y_axis(true)
+                    .y_tick_count(ticks)
+                    .y_tick_format(|v| health::compact(v))
+                    .into_any_element()
+            } else {
+                let c = AreaChart::new(data)
+                    .x(|p: &Pt| p.t.clone())
+                    .y(|p: &Pt| p.v)
+                    .stroke(color)
+                    .fill(linear_gradient(0., linear_color_stop(color.opacity(0.4), 1.), linear_color_stop(theme.background.opacity(0.1), 0.)))
+                    .tick_margin(tick)
+                    .y_domain(lo, hi)
+                    .y_axis(true)
+                    .y_tick_count(ticks)
+                    .y_tick_format(|v| health::compact(v));
+                c.into_any_element()
+            };
+            v_flex()
+                .w(px(dashboard::SIZES[w.size as usize % 3].1))
+                .h(px(260.))
+                .border_1()
+                .border_color(theme.border)
+                .rounded(theme.radius)
+                .child(
+                    h_flex()
+                        .px_3()
+                        .py_2()
+                        .gap_2()
+                        .items_baseline()
+                        .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child(info.name.clone()))
+                        .child(div().text_sm().text_color(theme.muted_foreground).child(source))
+                        .child(div().ml_auto().text_xl().font_weight(FontWeight::SEMIBOLD).child(current)),
+                )
+                .child(div().px_3().text_xs().text_color(theme.muted_foreground).child(if info.unit.is_empty() { "value".to_string() } else { format!("{} ({}) · time axis: seconds ago", info.name, info.unit) }))
+                .child(chart)
+                .into_any_element()
+        };
+        let label = info.name.clone();
         v_flex()
-            .p_6()
-            .gap_4()
-            .size_full()
-            .child(h_flex().flex_wrap().gap_3().children(self.channels.iter().map(|c| self.gauge(c, cx))))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .gap_3()
-                    .children(self.chart_keys.iter().enumerate().filter_map(|(i, key)| {
-                        let ch = self.channels.iter().find(|c| &c.key == key)?;
-                        let title = if ch.unit.is_empty() { ch.name.clone() } else { format!("{} ({})", ch.name, ch.unit) };
-                        let color = [cx.theme().red, cx.theme().blue][i % 2];
-                        Some(self.chart(title, i, color, cx))
-                    })),
-            )
+            .id(SharedString::from(format!("widget-{ix}")))
+            .gap_1()
+            .cursor_grab()
+            .on_drag(DragWidget(ix), move |_, _, _, cx| {
+                let label = label.clone();
+                cx.new(|_| DragPreview { label })
+            })
+            .drag_over::<DragWidget>(|style, _, _, _| style.bg(gpui_kit::hsla(0.6, 0.8, 0.5, 0.18)))
+            .on_drop(cx.listener(move |this, from: &DragWidget, _, cx| {
+                if from.0 < this.widgets.len() && ix < this.widgets.len() && from.0 != ix {
+                    let w = this.widgets.remove(from.0);
+                    this.widgets.insert(ix, w);
+                    this.save_dashboard();
+                }
+                cx.notify();
+            }))
+            .when(!is_chart, |d| if self.ui.bench { d.w(relative(0.485)) } else { d.w(px(236.)) })
+            .child(body)
+            .when(self.editing, |this| this.child(edit_bar))
             .into_any_element()
     }
 
-    fn render_codes(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .p_6()
-            .gap_4()
-            .size_full()
-            .children(self.notice.clone().map(|n| div().text_sm().text_color(cx.theme().muted_foreground).child(n)))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(120.))
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .rounded(cx.theme().radius_lg)
-                    .overflow_hidden()
-                    .child(DataTable::new(&self.codes).stripe(true).small()),
-            )
-            .child(h_flex().gap_4().items_start().child(self.render_freeze(cx)).child(self.render_readiness(cx)))
-    }
-
-    /// The buttons at the right of the page header.
-    fn page_actions(&self, cx: &mut Context<Self>) -> AnyElement {
-        let online = matches!(self.link, Link::Online { .. });
-        match self.page {
-            Page::Overview => Button::new("scan-all")
-                .primary()
-                .icon(IconName::RefreshCw)
-                .label("Scan all modules")
-                .disabled(!online)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let _ = this.backend.cmds.send(Cmd::ReadDtcs);
-                    let _ = this.backend.cmds.send(Cmd::ScanModules);
-                    cx.notify();
-                }))
-                .into_any_element(),
-            Page::Codes if self.confirm_clear => h_flex()
-                .gap_2()
+    /// The signal picker: engine channels and each module's own values, searchable, added with one click.
+    fn picker_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.picker {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let search = self.input_for("pick-search".into(), "Search, e.g. coolant, boost, injector", window, cx);
+        let query = search.read(cx).value().trim().to_lowercase();
+        let tabs: Vec<(Option<u32>, String)> = std::iter::once((None, "Engine".to_string()))
+            .chain(self.modules.iter().filter(|m| !params::get().for_module(m.tx_id).is_empty()).map(|m| (Some(m.tx_id), self.module_title(m.tx_id))))
+            .collect();
+        let tab = self.picker_tab.filter(|id| tabs.iter().any(|(t, _)| *t == Some(*id)));
+        let on_dashboard = |sig: &dashboard::Sig| self.widgets.iter().any(|w| &w.sig == sig);
+        let row = |id: String, name: String, unit: String, sig: dashboard::Sig, cx: &mut Context<Self>| {
+            let added = on_dashboard(&sig);
+            h_flex()
+                .gap_3()
+                .px_2()
+                .py_1()
                 .items_center()
-                .child(div().text_xs().text_color(cx.theme().red).child("Erases codes, freeze-frame data and readiness monitors."))
-                .child(Button::new("cancel").label("Cancel").on_click(cx.listener(|this, _, _, cx| {
-                    this.confirm_clear = false;
+                .border_b_1()
+                .border_color(theme.border.opacity(0.5))
+                .child(div().w(px(70.)).flex_none().text_sm().text_color(theme.muted_foreground).child(id.clone()))
+                .child(div().flex_1().text_base().child(if unit.is_empty() { name } else { format!("{name} ({unit})") }))
+                .child(Button::new(SharedString::from(format!("pk-{}", sig.id()))).label(if added { "Remove" } else { "Add" }).when(!added, |b| b.primary()).on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_signal(sig.clone());
                     cx.notify();
                 })))
-                .child(Button::new("confirm").danger().label("Clear codes").on_click(cx.listener(|this, _, _, cx| {
-                    this.confirm_clear = false;
-                    this.notice = None;
-                    let _ = this.backend.cmds.send(Cmd::ClearDtcs);
-                    cx.notify();
-                })))
-                .into_any_element(),
-            Page::Codes => h_flex()
-                .gap_2()
-                .child(Button::new("rescan").icon(IconName::RefreshCw).label("Read codes").on_click(cx.listener(|this, _, _, _| {
-                    let _ = this.backend.cmds.send(Cmd::ReadDtcs);
-                })))
-                .child(
-                    Button::new("clear")
-                        .label("Clear codes…")
-                        .disabled(self.code_count(cx) == 0 || !online)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.confirm_clear = true;
-                            cx.notify();
+                .into_any_element()
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let note;
+        match tab {
+            None => {
+                for c in self.channels.iter().filter(|c| query.is_empty() || c.name.to_lowercase().contains(&query)) {
+                    rows.push(row(c.key.trim_start_matches("pid:").to_uppercase(), c.name.clone(), c.unit.clone(), dashboard::Sig::Obd(c.key.clone()), cx));
+                }
+                note = format!("{} engine signals", rows.len());
+            }
+            Some(tx) => {
+                let supported = self.param_supported.get(&tx).filter(|_| self.picker_supported_only);
+                let mut seen = BTreeSet::new();
+                let all: Vec<&params::Param> = params::get()
+                    .for_module(tx)
+                    .iter()
+                    .filter(|p| supported.is_none_or(|set| set.contains(&p.did)))
+                    .filter(|p| query.is_empty() || p.name.to_lowercase().contains(&query))
+                    .filter(|p| seen.insert((p.did, p.bit)))
+                    .collect();
+                note = format!("{} of {} values", all.len().min(self.param_limit), all.len());
+                for p in all.into_iter().take(self.param_limit) {
+                    rows.push(row(format!("{:04X}", p.did), p.name.clone(), p.unit.clone(), dashboard::Sig::Param { tx, did: p.did, bit: p.bit }, cx));
+                }
+            }
+        }
+        let total_hint = rows.len() >= self.param_limit && tab.is_some();
+        let probing = tab.and_then(|tx| self.probe.filter(|(id, ..)| *id == tx));
+        let probed = tab.is_some_and(|tx| self.param_supported.contains_key(&tx));
+        let card = v_flex()
+            .w(px(720.))
+            .h(px(640.))
+            .max_w(relative(0.96))
+            .max_h(relative(0.92))
+            .gap_3()
+            .p_5()
+            .bg(theme.background)
+            .border_1()
+            .border_color(theme.border)
+            .rounded(theme.radius_lg)
+            .child(
+                h_flex()
+                    .items_center()
+                    .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child("Add to dashboard"))
+                    .child(div().flex_1())
+                    .child(Button::new("pick-done").with_size(btn()).primary().label(i18n::tr("Done")).on_click(cx.listener(|this, _, _, cx| {
+                        this.picker = false;
+                        cx.notify();
+                    }))),
+            )
+            .child(h_flex().gap_2().flex_wrap().children(tabs.into_iter().map(|(id, label)| {
+                Button::new(SharedString::from(format!("pt-{}", id.unwrap_or(0))))
+                    .label(label)
+                    .when(id == tab, |b| b.primary())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.picker_tab = id;
+                        this.param_limit = 60;
+                        cx.notify();
+                    }))
+            })))
+            .child(Input::new(&search))
+            .when(tab.is_some(), |this| {
+                let tx = tab.unwrap_or(0);
+                this.child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .flex_wrap()
+                        .child(match probing {
+                            Some(_) => Button::new("pk-stop").label("Stop").on_click(cx.listener(|this, _, _, cx| {
+                                let _ = this.backend.cmds.send(Cmd::CancelSweep);
+                                cx.notify();
+                            })),
+                            None => Button::new("pk-probe").label("Check which this module has").on_click(cx.listener(move |this, _, _, cx| {
+                                let mut dids: Vec<u16> = params::get().for_module(tx).iter().map(|p| p.did).collect();
+                                dids.sort_unstable();
+                                dids.dedup();
+                                this.probe = Some((tx, 0, dids.len()));
+                                let _ = this.backend.cmds.send(Cmd::ProbeDids { tx_id: tx, dids });
+                                cx.notify();
+                            })),
+                        })
+                        .when(probed, |this| {
+                            this.child(Button::new("pk-only").label(if self.picker_supported_only { "Showing only what it has" } else { "Showing everything: show only what it has" }).when(self.picker_supported_only, |b| b.primary()).on_click(cx.listener(|this, _, _, cx| {
+                                this.picker_supported_only = !this.picker_supported_only;
+                                cx.notify();
+                            })))
+                        })
+                        .child(div().text_sm().text_color(theme.muted_foreground).child(match (probing, probed) {
+                            (Some((_, done, total)), _) => format!("Asking the module… {done} of {total} (read-only)"),
+                            (None, true) => "Done: switch to 'only what it has' to hide the rest.".into(),
+                            _ => "A module only answers for values it has. This asks it, read-only (a minute or two for the engine ECU).".into(),
                         })),
                 )
-                .into_any_element(),
-            Page::Modules => Button::new("scan-modules")
-                .primary()
-                .icon(IconName::RefreshCw)
-                .label("Scan modules")
-                .disabled(!online)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    let _ = this.backend.cmds.send(Cmd::ScanModules);
+            })
+            .child(div().text_sm().text_color(theme.muted_foreground).child(note))
+            .child(v_flex().id("pick-list").flex_1().min_h_0().overflow_y_scroll().children(rows).when(total_hint, |this| {
+                this.child(h_flex().p_2().child(Button::new("pk-more").label("Show more").on_click(cx.listener(|this, _, _, cx| {
+                    this.param_limit += 60;
                     cx.notify();
-                }))
+                }))))
+            }));
+        Some(
+            div()
+                .id("picker-modal")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui_kit::hsla(0., 0., 0., 0.6))
+                .child(card)
                 .into_any_element(),
-            Page::Contribute => Button::new("export")
-                .label(format!("Export {} contribution(s)", self.contrib.len()))
-                .on_click(cx.listener(|this, _, _, cx| this.export_contributions(cx)))
-                .into_any_element(),
-            Page::Vehicles => Button::new("read-vin")
-                .icon(IconName::RefreshCw)
-                .label("Read VIN from vehicle")
-                .disabled(!online)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.notice = Some("Reading the VIN…".into());
-                    let _ = this.backend.cmds.send(Cmd::ReadVin);
-                    cx.notify();
-                }))
-                .into_any_element(),
-            Page::Live | Page::Readiness | Page::Functions | Page::ModuleData => div().into_any_element(),
-        }
+        )
     }
+
+    /// What to show when there is nothing to show yet: why, and what the mechanic can do about it.
+    fn empty_state(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let (title, hint) = match &self.link {
+            Link::Offline(reason) => (
+                format!("Adapter offline: {reason}"),
+                format!(
+                    "Check that the adapter is plugged into the car's OBD-II port (under the dash) and the cable is secure, and that the ignition is ON. Still trying (attempt {}).",
+                    self.offline_attempts
+                ),
+            ),
+            Link::Connecting => ("Connecting to the adapter…".to_string(), "This takes a few seconds.".to_string()),
+            Link::Online { .. } => (
+                "Waiting for the engine ECU to answer…".to_string(),
+                "Turn the ignition ON (some cars need the engine running). If nothing appears, the car may not support OBD-II live data.".to_string(),
+            ),
+        };
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .px_8()
+            .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).text_color(theme.foreground).child(title))
+            .child(div().text_base().text_color(theme.muted_foreground).child(hint))
+            .into_any_element()
+    }
+
+
+
+
 
     /// Title and one line of context under it.
     fn page_subtitle(&self, cx: &App) -> String {
         match self.page {
             Page::Overview => match &self.link {
+                Link::Online { .. } if self.scanning => "Scanning modules…".into(),
                 Link::Online { .. } => format!("{} module(s) scanned", self.modules.len()),
                 Link::Connecting => "Connecting…".into(),
-                Link::Offline(reason) => reason.clone(),
+                Link::Offline(reason) => format!("Adapter offline: {reason}"),
             },
-            Page::Codes => match self.code_count(cx) {
-                0 => "No stored or pending trouble codes".into(),
+            Page::Codes => match self.faults(cx).len() {
+                0 if self.modules.is_empty() => "No codes in the engine ECU (other modules not scanned)".into(),
+                0 => "No stored or pending trouble codes in any module".into(),
                 n => format!("{n} trouble code(s)"),
             },
-            Page::Live => format!("{} parameter(s)", self.channels.len()),
+            Page::Live => format!("{} on the dashboard", self.widgets.len()),
             Page::Readiness => match &self.readiness {
                 Some(r) => format!("{} of {} monitors ready", r.monitors.iter().filter(|m| m.supported && m.complete).count(), r.monitors.iter().filter(|m| m.supported).count()),
                 None => "Not read yet".into(),
@@ -1106,149 +1806,13 @@ impl Diagnostics {
             Page::Modules => self.notice.clone().unwrap_or_else(|| {
                 if self.modules.is_empty() { "Scan the vehicle's diagnostic network for modules (read-only).".into() } else { format!("{} module(s)", self.modules.len()) }
             }),
-            Page::ModuleData => "Parameters FORScan knows for a module. Each one is read only when you press Read.".into(),
-            Page::Functions => "What each module can do, from your own FORScan import. Run… asks you to confirm first.".into(),
+            Page::Functions => i18n::tr("Tests and procedures each module offers. Nothing runs until you confirm.").into(),
             Page::Vehicles => format!("{} saved · the VIN is read from the car when possible", self.vehicles.len()),
             Page::Contribute => "Name modules and describe codes the shared database does not know yet.".into(),
+            Page::Procedures => i18n::tr("Guided jobs, step by step. Every step that acts on the car asks you first.").into(),
+            Page::History => format!("{} earlier visit(s) · {} backup(s) for this vehicle", self.ws.history.len(), self.ws.backups.len()),
+            Page::Trace => "Every message sent to and received from the car, for finding out why a module does not answer.".into(),
         }
-    }
-
-    fn stat(&self, label: &'static str, value: String, unit: &'static str, note: String, note_color: Hsla, last: bool, cx: &Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        v_flex()
-            .flex_1()
-            .gap_1()
-            .p_4()
-            .when(!last, |this| this.border_r_1().border_color(theme.border))
-            .child(div().text_xs().text_color(theme.muted_foreground).child(label))
-            .child(
-                h_flex()
-                    .gap_1()
-                    .items_baseline()
-                    .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child(value))
-                    .child(div().text_sm().text_color(theme.muted_foreground).child(unit)),
-            )
-            .child(div().text_xs().text_color(note_color).child(note))
-    }
-
-    fn render_overview(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let codes = self.codes.read(cx).delegate().codes.iter().map(|e| (e.code.to_string(), e.kind, e.ecu)).collect::<Vec<_>>();
-        let pending = codes.iter().filter(|c| c.1 == "pending").count();
-        let reading = |key: &str| self.readings.get(key).copied();
-        let (ready, supported) = self.readiness.as_ref().map_or((0, 0), |r| {
-            (r.monitors.iter().filter(|m| m.supported && m.complete).count(), r.monitors.iter().filter(|m| m.supported).count())
-        });
-        let make = self.make.clone();
-        let db = dtcdb::get();
-
-        let stats = h_flex()
-            .border_1()
-            .border_color(theme.border)
-            .rounded(theme.radius_lg)
-            .overflow_hidden()
-            .child(self.stat(
-                "Trouble codes",
-                codes.len().to_string(),
-                "",
-                if codes.is_empty() { "None stored".into() } else { format!("{} stored, {pending} pending", codes.len() - pending) },
-                if codes.is_empty() { theme.green } else { theme.red },
-                false,
-                cx,
-            ))
-            .child(self.stat(
-                "Battery voltage",
-                reading("pid:42").map_or("—".into(), |v| format!("{v:.1}")),
-                "V",
-                reading("pid:42").map_or("Not reported".into(), |v| if v < 12.0 { "Low".into() } else { "Normal".into() }),
-                reading("pid:42").map_or(theme.muted_foreground, |v| if v < 12.0 { theme.yellow } else { theme.green }),
-                false,
-                cx,
-            ))
-            .child(self.stat(
-                "Coolant temperature",
-                reading("pid:05").map_or("—".into(), |v| format!("{v:.0}")),
-                "°C",
-                reading("pid:05").map_or("Not reported".into(), |v| if v < 70.0 { "Warming up".into() } else { "At operating temperature".into() }),
-                reading("pid:05").map_or(theme.muted_foreground, |v| if v < 70.0 { theme.yellow } else { theme.green }),
-                false,
-                cx,
-            ))
-            .child(self.stat(
-                "Readiness monitors",
-                if supported == 0 { "—".into() } else { ready.to_string() },
-                if supported == 0 { "" } else { "ready" },
-                if supported == 0 { "Not read yet".into() } else if ready == supported { "Ready for inspection".into() } else { format!("{} of {supported} not ready", supported - ready) },
-                if supported == 0 { theme.muted_foreground } else if ready == supported { theme.green } else { theme.yellow },
-                true,
-                cx,
-            ));
-
-        let fault_rows = codes.iter().take(5).map(|(code, kind, ecu)| {
-            let info = db.lookup(code, make.as_deref());
-            let description = match (&info.scope, self.own_description(code)) {
-                (dtcdb::Scope::Unknown, Some(own)) => own.to_string(),
-                _ => info.description,
-            };
-            let color = if *kind == "stored" { theme.red } else { theme.yellow };
-            h_flex()
-                .gap_3()
-                .px_3()
-                .h_10()
-                .items_center()
-                .border_b_1()
-                .border_color(theme.border.opacity(0.7))
-                .child(div().w(px(70.)).font_weight(FontWeight::SEMIBOLD).child(code.clone()))
-                .child(div().flex_1().truncate().child(description))
-                .child(div().w(px(60.)).text_xs().text_color(theme.muted_foreground).child(format!("{ecu:03X}")))
-                .child(div().w(px(70.)).text_xs().text_color(color).child(*kind))
-        });
-
-        let gauges = h_flex().flex_wrap().gap_3().children(self.channels.iter().take(6).map(|c| self.gauge(c, cx)));
-
-        v_flex()
-            .id("overview")
-            .p_6()
-            .gap_6()
-            .size_full()
-            .overflow_y_scroll()
-            .child(stats)
-            .child(
-                v_flex()
-                    .gap_2()
-                    .child(h_flex().justify_between().items_center().child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Fault codes")).child(
-                        Button::new("all-codes").ghost().small().label("View all").on_click(cx.listener(|this, _, _, cx| {
-                            this.page = Page::Codes;
-                            cx.notify();
-                        })),
-                    ))
-                    .child(
-                        v_flex()
-                            .border_1()
-                            .border_color(theme.border)
-                            .rounded(theme.radius_lg)
-                            .overflow_hidden()
-                            .children(fault_rows)
-                            .when(codes.is_empty(), |this| {
-                                this.child(div().p_3().text_color(theme.muted_foreground).child("No stored or pending trouble codes."))
-                            }),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .gap_2()
-                    .child(h_flex().justify_between().items_center().child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child("Live data")).child(
-                        Button::new("open-live").ghost().small().label("Open").on_click(cx.listener(|this, _, _, cx| {
-                            this.page = Page::Live;
-                            cx.notify();
-                        })),
-                    ))
-                    .child(if self.channels.is_empty() {
-                        div().text_color(theme.muted_foreground).child("Waiting for the ECU…").into_any_element()
-                    } else {
-                        gauges.into_any_element()
-                    }),
-            )
     }
 
     fn render_vehicles(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1258,7 +1822,7 @@ impl Diagnostics {
             h_flex()
                 .gap_3()
                 .px_3()
-                .h_12()
+                .h(px(56.))
                 .items_center()
                 .border_b_1()
                 .border_color(theme.border.opacity(0.7))
@@ -1267,21 +1831,26 @@ impl Diagnostics {
                         .flex_1()
                         .min_w_0()
                         .child(div().font_weight(FontWeight::SEMIBOLD).truncate().child(v.name.clone()))
-                        .child(div().text_xs().text_color(theme.muted_foreground).child(format!(
+                        .child(div().text_sm().text_color(theme.muted_foreground).child(format!(
                             "{}  ·  {}",
                             v.make,
-                            v.vin.as_deref().unwrap_or("no VIN")
+                            v.vin.as_deref().map_or("no VIN".to_string(), health::mask_vin)
                         ))),
                 )
+                .children(v.vin.clone().map(|vin| {
+                    Button::new(SharedString::from(format!("copy-vin-{ix}"))).ghost().icon(IconName::Copy).label(i18n::tr("Copy VIN")).on_click(cx.listener(
+                        move |this, _, _, cx| this.copy_text(vin.clone(), "the VIN", cx),
+                    ))
+                }))
                 .child(if on {
-                    div().text_xs().text_color(theme.green).child("In use").into_any_element()
+                    div().text_sm().text_color(theme.green).child("In use").into_any_element()
                 } else {
-                    Button::new(SharedString::from(format!("use-{ix}"))).small().label("Use").on_click(cx.listener(
+                    Button::new(SharedString::from(format!("use-{ix}"))).label("Use").on_click(cx.listener(
                         move |this, _, window, cx| this.select_vehicle(ix, window, cx),
                     )).into_any_element()
                 })
                 .child(
-                    Button::new(SharedString::from(format!("remove-{ix}"))).ghost().small().icon(IconName::Delete).on_click(cx.listener(
+                    Button::new(SharedString::from(format!("remove-{ix}"))).ghost().icon(IconName::Delete).on_click(cx.listener(
                         move |this, _, window, cx| this.remove_vehicle(ix, window, cx),
                     )),
                 )
@@ -1314,432 +1883,76 @@ impl Diagnostics {
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .child(div().w(px(80.)).text_xs().text_color(theme.muted_foreground).child("Name"))
+                            .child(div().w(px(80.)).text_sm().text_color(theme.muted_foreground).child("Name"))
                             .child(div().flex_1().child(Input::new(&self.name_input))),
                     )
                     .child(
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .child(div().w(px(80.)).text_xs().text_color(theme.muted_foreground).child("Make"))
+                            .child(div().w(px(80.)).text_sm().text_color(theme.muted_foreground).child("Make"))
                             .child(div().w(px(240.)).child(Select::new(&self.make_select).placeholder("Select make…").menu_width(px(240.)))),
                     )
                     .child(
                         h_flex()
                             .gap_2()
                             .items_center()
-                            .child(div().w(px(80.)).text_xs().text_color(theme.muted_foreground).child("VIN"))
+                            .child(div().w(px(80.)).text_sm().text_color(theme.muted_foreground).child("VIN"))
                             .child(div().flex_1().child(Input::new(&self.vin_input))),
                     )
-                    .child(h_flex().pt_1().child(Button::new("add-vehicle").primary().label("Add vehicle").on_click(cx.listener(
+                    .child(h_flex().pt_1().child(Button::new("add-vehicle").with_size(btn()).primary().label("Add vehicle").on_click(cx.listener(
                         |this, _, window, cx| this.add_vehicle(window, cx),
                     )))),
             )
     }
+}
 
-    fn render_readiness_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .p_6()
-            .gap_4()
-            .size_full()
-            .child(self.render_readiness(cx))
-            .child(self.render_freeze(cx))
-    }
+/// Tablet mode: everything bigger, for touch use at the car. Kept in `<data dir>/size`.
+static TABLET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    fn render_modules(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let make = self.make.clone();
-        v_flex()
-            .id("module-list")
-            .p_6()
-            .gap_3()
-            .size_full()
-            .overflow_y_scroll()
-            .children(self.modules.iter().map(|m| self.module_card(m, make.as_deref(), cx)).collect::<Vec<_>>())
-    }
+fn tablet() -> bool {
+    TABLET.load(std::sync::atomic::Ordering::Relaxed)
+}
 
-    /// Parameters FORScan knows for one module. Nothing is sent until Read is pressed on a row.
-    fn render_module_data(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        const SHOWN: usize = 60;
-        let theme = cx.theme().clone();
-        let note = |text: String| div().text_xs().text_color(theme.muted_foreground).child(text);
-        let known = params::get();
-        let mut page = v_flex().id("module-data").p_6().gap_3().size_full().overflow_y_scroll();
-        if known.is_empty() {
-            return page.child(note(
-                "No FORScan import found. Run scripts/forscan_import.py on your own forscan.sqlite with --write, then reopen this page. \
-                 The data stays on this computer."
-                    .into(),
-            ));
-        }
-        if self.modules.is_empty() {
-            return page.child(note("Scan the modules first (Modules page); parameters are listed for the modules found.".into()));
-        }
-        let make = self.make.clone();
-        let ids: Vec<(u32, String)> = self
-            .modules
-            .iter()
-            .map(|m| {
-                let name = self
-                    .own_module_name(m.tx_id)
-                    .map(String::from)
-                    .or_else(|| modnames::get().name(m.tx_id, make.as_deref()).map(String::from))
-                    .unwrap_or_else(|| "Module".to_string());
-                (m.tx_id, format!("{:03X} {name}", m.tx_id))
-            })
-            .collect();
-        let selected = self.param_module.filter(|id| ids.iter().any(|(i, _)| i == id)).unwrap_or(ids[0].0);
-        let search = self.input_for("params-search".into(), "Filter by name, e.g. injector", window, cx);
-        page = page
-            .child(note(
-                "Names, identifiers and scaling come from your own FORScan import. A module only answers for identifiers it has, \
-                 and the list covers every engine and software variant, so many will say not supported. Scaled values are unverified: \
-                 the raw bytes are always shown."
-                    .into(),
-            ))
-            .child(h_flex().gap_2().flex_wrap().children(ids.iter().map(|(id, label)| {
-                let id = *id;
-                Button::new(SharedString::from(format!("pm-{id}")))
-                    .label(label.clone())
-                    .when(id == selected, |b| b.primary())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.param_module = Some(id);
-                        cx.notify();
-                    }))
-            })))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(div().flex_1().child(Input::new(&search)))
-                    .child(Button::new("pm-search").label("Search").on_click(cx.listener(move |this, _, _, cx| {
-                        let query = this.inputs.get("params-search").map(|i| i.read(cx).value().trim().to_lowercase()).unwrap_or_default();
-                        this.param_query = query;
-                        cx.notify();
-                    }))),
-            );
-        let all = known.for_module(selected);
-        let supported = self.param_supported.get(&selected);
-        let probing = self.probe.filter(|(id, ..)| *id == selected);
-        page = page.child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(match probing {
-                    Some(_) => Button::new("pm-stop").label("Stop").on_click(cx.listener(|this, _, _, cx| {
-                        let _ = this.backend.cmds.send(Cmd::CancelSweep);
-                        cx.notify();
-                    })),
-                    None => Button::new("pm-probe").label("Check which this module has").on_click(cx.listener(move |this, _, _, cx| {
-                        let mut dids: Vec<u16> = params::get().for_module(selected).iter().map(|p| p.did).collect();
-                        dids.sort_unstable();
-                        dids.dedup();
-                        this.probe = Some((selected, 0, dids.len()));
-                        let _ = this.backend.cmds.send(Cmd::ProbeDids { tx_id: selected, dids });
-                        cx.notify();
-                    })),
-                })
-                .children(supported.map(|_| {
-                    Button::new("pm-all").label(if self.param_all { "Showing all: show only what it has" } else { "Showing only what it has: show all" }).on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.param_all = !this.param_all;
-                            cx.notify();
-                        }),
-                    )
-                }))
-                .child(note(match (probing, supported) {
-                    (Some((_, done, total)), _) => format!("Asking the module… {done} of {total} (read-only)"),
-                    (None, Some(set)) => format!("The module answered {} identifier(s); their values are shown.", set.len()),
-                    (None, None) => "Asks the module about each listed identifier (read-only) and keeps the ones it has. A minute or two for the PCM.".into(),
-                })),
-        );
-        let only: Option<&BTreeSet<u16>> = supported.filter(|_| !self.param_all);
-        let query = self.param_query.clone();
-        let matches: Vec<&params::Param> = all
-            .iter()
-            .filter(|p| only.is_none_or(|set| set.contains(&p.did)))
-            .filter(|p| query.is_empty() || p.name.to_lowercase().contains(&query))
-            .collect();
-        page = page.child(note(format!(
-            "{} of {} {} for {:03X}{}",
-            matches.len().min(SHOWN),
-            only.map_or(all.len(), |_| matches.len()),
-            if only.is_some() { "the module has" } else { "parameters" },
-            selected,
-            if matches.len() > SHOWN { format!(" (first {SHOWN} of {} matches: narrow the search)", matches.len()) } else { String::new() }
-        )));
-        for p in matches.into_iter().take(SHOWN) {
-            let did = p.did;
-            let answer = match self.param_values.get(&(selected, did)) {
-                None => None,
-                Some(Ok(data)) => Some((p.show(data), theme.foreground)),
-                Some(Err(why)) => Some((why.clone(), theme.muted_foreground)),
-            };
-            page = page.child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .text_xs()
-                    .child(div().w(px(70.)).text_color(theme.muted_foreground).child(format!("{did:04X}")))
-                    .child(div().w(px(380.)).text_color(theme.foreground).child(p.name.clone()))
-                    .child(Button::new(SharedString::from(format!("rd-{selected}-{did}-{}", p.bit))).label("Read").on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            let _ = this.backend.cmds.send(Cmd::ReadDid { tx_id: selected, did });
-                            cx.notify();
-                        },
-                    )))
-                    .children(answer.map(|(text, color)| div().text_color(color).child(text))),
-            );
-        }
-        page
-    }
+/// Button size for the main actions.
+fn btn() -> Size {
+    if tablet() { Size::Large } else { Size::Medium }
+}
 
-    /// Functions FORScan knows for the modules found on this car, read from the user's own import.
-    fn render_functions(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let note = |text: String| div().text_xs().text_color(theme.muted_foreground).child(text);
-        let known = functions::get();
-        let make = self.make.clone();
-        let mut page = v_flex().id("function-list").p_6().gap_3().size_full().overflow_y_scroll();
-        if known.is_empty() {
-            return page.child(note(
-                "No FORScan import found. Run scripts/forscan_import.py on your own forscan.sqlite with --write, then reopen this page. \
-                 The data stays on this computer."
-                    .into(),
-            ));
-        }
-        if self.modules.is_empty() {
-            return page.child(note("Scan the modules first (Modules page); functions are listed for the modules found.".into()));
-        }
-        page = page.child(note(
-            "Run… starts the routine in the module after you confirm, then asks it for the routine's result and its trouble codes. \
-             Routines that take an option record send it as listed (the option value as big-endian bytes). The rest are shown only. \
-             Functions that need security access will be refused until that is supported."
-                .into(),
-        ));
-        for m in &self.modules {
-            let title = self
-                .own_module_name(m.tx_id)
-                .map(String::from)
-                .or_else(|| modnames::get().name(m.tx_id, make.as_deref()).map(String::from))
-                .unwrap_or_else(|| "Module".to_string());
-            let list = known.for_module(m.tx_id);
-            page = page.child(
-                v_flex()
-                    .gap_1()
-                    .p_3()
-                    .border_1()
-                    .border_color(theme.border)
-                    .rounded(theme.radius)
-                    .child(div().text_sm().text_color(theme.foreground).child(format!("{title}  ·  {:03X}", m.tx_id)))
-                    .when(list.is_empty(), |this| this.child(note("No functions in the import for this module.".into())))
-                    .children(list.iter().enumerate().map(|(i, f)| {
-                        let tx_id = m.tx_id;
-                        let mut detail = Vec::new();
-                        if !f.routine.is_empty() {
-                            detail.push(format!("routine {}", f.routine.to_uppercase()));
-                        }
-                        if !f.reads.is_empty() {
-                            detail.push(format!("reads {}", f.reads));
-                        }
-                        if !f.writes.is_empty() {
-                            detail.push(format!("writes {}", f.writes));
-                        }
-                        if f.needs_security() {
-                            detail.push(format!("needs security access {}: expect a refusal", f.security.to_uppercase()));
-                        }
-                        let confirming = self.confirm_run == Some((tx_id, i));
-                        let routine = f.routine_id();
-                        let (session, title) = (f.session, f.title.clone());
-                        let mode = match f.engine_mode {
-                            Some(1) => " Ignition on, engine OFF.",
-                            Some(2) => " Engine RUNNING.",
-                            _ => "",
-                        };
-                        let result = routine.and_then(|r| self.run_results.get(&(tx_id, r)));
-                        let option = f.option.clone();
-                        let option_text = option.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .text_xs()
-                                    .child(div().w(px(300.)).text_color(theme.foreground).child(f.title.clone()))
-                                    .child(div().text_color(theme.muted_foreground).child(detail.join(" · ")))
-                                    .when(f.runnable && routine.is_some() && !confirming, |this| {
-                                        this.child(Button::new(SharedString::from(format!("run-{tx_id}-{i}"))).label("Run…").on_click(cx.listener(
-                                            move |this, _, _, cx| {
-                                                this.confirm_run = Some((tx_id, i));
-                                                cx.notify();
-                                            },
-                                        )))
-                                    })
-                                    .when(!f.runnable, |this| {
-                                        this.child(div().text_color(theme.muted_foreground).child("display only: needs input FORScan builds itself"))
-                                    }),
-                            )
-                            .when(confirming, |this| {
-                                this.child(
-                                    h_flex()
-                                        .gap_2()
-                                        .items_center()
-                                        .text_xs()
-                                        .child(div().text_color(theme.red).child(format!(
-                                            "Start \"{title}\" on module {tx_id:03X}? This sends routine {:04X}{} and acts on the car: it may change what is stored in it.{mode}",
-                                            routine.unwrap_or(0),
-                                            if option_text.is_empty() { String::new() } else { format!(" with option {option_text}") }
-                                        )))
-                                        .child(Button::new(SharedString::from(format!("go-{tx_id}-{i}"))).label("Start").on_click(cx.listener(
-                                            move |this, _, _, cx| {
-                                                this.confirm_run = None;
-                                                if let Some(routine) = routine {
-                                                    this.run_results.remove(&(tx_id, routine));
-                                                    let _ = this.backend.cmds.send(Cmd::RunRoutine { tx_id, routine, session, option: option.clone() });
-                                                }
-                                                cx.notify();
-                                            },
-                                        )))
-                                        .child(Button::new(SharedString::from(format!("no-{tx_id}-{i}"))).label("Cancel").on_click(cx.listener(
-                                            |this, _, _, cx| {
-                                                this.confirm_run = None;
-                                                cx.notify();
-                                            },
-                                        ))),
-                                )
-                            })
-                            .children(result.map(|(r, after)| {
-                                let (text, color) = match r {
-                                    Ok(bytes) if bytes.is_empty() => ("started: the module accepted the start request (that is not proof it finished)".to_string(), theme.green),
-                                    Ok(bytes) => (
-                                        format!(
-                                            "started: {} (accepted the start request; that is not proof it finished)",
-                                            bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
-                                        ),
-                                        theme.green,
-                                    ),
-                                    Err(why) => (why.clone(), theme.yellow),
-                                };
-                                v_flex()
-                                    .child(div().text_xs().text_color(color).child(text))
-                                    .when(!after.is_empty(), |this| this.child(div().text_xs().text_color(theme.muted_foreground).child(after.clone())))
-                            }))
-                    })),
-            );
-        }
-        page
-    }
+fn load_tablet() {
+    let on = dtcdb::data_dir().and_then(|d| std::fs::read_to_string(d.join("size")).ok()).is_some_and(|t| t.trim() == "tablet");
+    TABLET.store(on, std::sync::atomic::Ordering::Relaxed);
+}
 
-    fn module_card(&self, m: &ModuleView, make: Option<&str>, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let tx_id = m.tx_id;
-        // the module's own system name if it gives one, else vehicle-db's name for this request ID
-        let title = m
-            .identity
-            .iter()
-            .find(|(k, _)| k == "System name")
-            .map(|(_, v)| v.clone())
-            .or_else(|| self.own_module_name(m.tx_id).map(String::from))
-            .or_else(|| modnames::get().name(m.tx_id, make).map(String::from))
-            .unwrap_or_else(|| "Module".to_string());
-        let row = |label: String, value: String, color: Hsla| {
-            h_flex()
-                .gap_2()
-                .text_xs()
-                .child(div().w(px(170.)).text_color(theme.muted_foreground).child(label))
-                .child(div().text_color(color).child(value))
-        };
-        let db = dtcdb::get();
-        v_flex()
-            .gap_1()
-            .p_3()
-            .border_1()
-            .border_color(theme.border)
-            .rounded(theme.radius)
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .child(div().text_sm().text_color(theme.foreground).child(format!("{title}  ·  {:03X} → {:03X}", m.tx_id, m.rx_id)))
-                    .child(Button::new(SharedString::from(format!("sweep-{tx_id}"))).label("Read data IDs").on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            let _ = this.backend.cmds.send(Cmd::SweepDids { tx_id });
-                            cx.notify();
-                        },
-                    ))),
-            )
-            .children(m.identity.iter().filter(|(k, _)| k != "System name").map(|(k, v)| row(k.clone(), v.clone(), theme.foreground)))
-            .children(m.dtcs.iter().map(|d| {
-                let info = db.lookup(&d.code[..5], make);
-                let description = match (&info.scope, self.own_description(&d.code[..5])) {
-                    (dtcdb::Scope::Unknown, Some(own)) => own.to_string(),
-                    _ => info.description,
-                };
-                let color = if d.status == "confirmed" { theme.red } else { theme.yellow };
-                row(format!("{} ({})", d.code, d.status), description, color)
-            }))
-            .children(m.dtc_note.iter().map(|n| row("Trouble codes".into(), n.clone(), theme.muted_foreground)))
-            .when(m.dtcs.is_empty() && m.dtc_note.is_none(), |this| this.child(row("Trouble codes".into(), "none".into(), theme.green)))
-            .child(row(
-                "Services".into(),
-                m.services.iter().map(|(n, s)| format!("{n}: {s}")).collect::<Vec<_>>().join(" · "),
-                theme.muted_foreground,
-            ))
-            .children(self.dids.get(&tx_id).map(|lines| {
-                v_flex()
-                    .mt_1()
-                    .pt_1()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(format!("Data identifiers F100–F1FF: {} found", lines.len())))
-                    .children(lines.iter().map(|l| {
-                        let label = if l.name.is_empty() { format!("{:04X}", l.did) } else { format!("{:04X}  {}", l.did, l.name) };
-                        row(label, l.value.clone(), theme.foreground)
-                    }))
-            }))
-            .into_any_element()
-    }
+/// The root view derives the rem size from the theme's font size on every frame, so that is what
+/// has to change (setting the window's rem size directly is overwritten).
+fn set_font_size(tablet_mode: bool, window: &mut Window, cx: &mut App) {
+    let size = px(if tablet_mode { 20. } else { 14. });
+    Theme::global_mut(cx).font_size = size;
+    window.set_rem_size(size);
+}
 
-    fn panel(&self, title: &'static str, cx: &Context<Self>) -> gpui_kit::Div {
-        v_flex()
-            .flex_1()
-            .gap_2()
-            .p_3()
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded(cx.theme().radius)
-            .child(div().text_sm().text_color(cx.theme().foreground).child(title))
+/// Applies the mode: text, spacing and rows are sized in rems, so one number scales them all.
+fn apply_size(tablet_mode: bool, window: &mut Window, cx: &mut App) {
+    TABLET.store(tablet_mode, std::sync::atomic::Ordering::Relaxed);
+    set_font_size(tablet_mode, window, cx);
+    if let Some(dir) = dtcdb::data_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("size"), if tablet_mode { "tablet" } else { "normal" });
     }
+}
 
-    fn render_freeze(&self, cx: &Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let panel = self.panel("Freeze frame", cx);
-        let Some(f) = &self.freeze else {
-            return panel.child(div().text_xs().text_color(theme.muted_foreground).child("No freeze frame stored."));
-        };
-        panel
-            .child(
-                div().text_xs().text_color(theme.muted_foreground).child(format!("Captured when {} was set", f.dtc)),
-            )
-            .child(h_flex().flex_wrap().gap_x_4().gap_y_1().children(f.values.iter().filter_map(|(p, v)| {
-                let info = pid::info(*p)?;
-                Some(div().text_xs().child(format!("{}: {v:.0} {}", info.name, info.unit)))
-            })))
+fn level_color(level: health::Level, theme: &gpui_kit::component::Theme) -> Hsla {
+    match level {
+        health::Level::Good => theme.green,
+        health::Level::Warn => theme.yellow,
+        health::Level::Bad => theme.red,
+        health::Level::Unknown => theme.muted_foreground,
     }
+}
 
-    fn render_readiness(&self, cx: &Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let panel = self.panel("Readiness monitors", cx);
-        let Some(r) = &self.readiness else {
-            return panel.child(div().text_xs().text_color(theme.muted_foreground).child("Not read yet."));
-        };
-        panel.child(h_flex().flex_wrap().gap_x_4().gap_y_1().children(r.monitors.iter().filter(|m| m.supported).map(
-            |m| {
-                let (mark, color) = if m.complete { ("✔", theme.green) } else { ("○", theme.yellow) };
-                div().text_xs().text_color(color).child(format!("{mark} {}", m.name))
-            },
-        )))
-    }
+fn fault_color(status: &str, theme: &gpui_kit::component::Theme) -> Hsla {
+    if status == "pending" { theme.yellow } else { theme.red }
 }
 
 /// Fewer decimals for wide ranges (rpm, km/h), more for narrow ones (volts, bar).
@@ -1748,212 +1961,24 @@ fn format_value(v: f64, span: f64) -> String {
     format!("{v:.decimals$}")
 }
 
+/// Hot reload (`scripts/hot.sh`, feature `hot`): the whole UI is rebuilt inside a subsecond call,
+/// so a patched `render_ui` or any page it calls takes effect on the next frame.
+#[cfg(feature = "hot")]
+fn hot<R>(f: impl FnMut() -> R) -> R {
+    subsecond::call(f)
+}
+
+#[cfg(not(feature = "hot"))]
+fn hot<R>(mut f: impl FnMut() -> R) -> R {
+    f()
+}
+
+/// Set by the subsecond handler when a patch has been applied, so the next pump redraws.
+static PATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl Render for Diagnostics {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let count = self.code_count(cx);
-        let ask_make = matches!(self.link, Link::Online { .. }) && self.make.is_none();
-        let theme = cx.theme().clone();
-        let (status, status_color) = match &self.link {
-            Link::Connecting => ("Connecting…".to_string(), theme.muted_foreground),
-            Link::Online { adapter, ecu } => {
-                let ecu = ecu.map(|e| format!(" · ECU {e:03X}")).unwrap_or_default();
-                let vin = self.vin.as_deref().map(|v| format!(" · VIN {v}")).unwrap_or_default();
-                let make = self.make.as_deref().map(|m| format!(" · {m}")).unwrap_or_default();
-                (format!("{adapter}{ecu}{vin}{make}"), theme.green)
-            }
-            Link::Offline(_) => ("Offline, retrying…".to_string(), theme.red),
-        };
-
-        // the vehicle at the top of the sidebar: make, and the VIN with its serial part hidden
-        let vehicle_title = match self.current.and_then(|ix| self.vehicles.get(ix)) {
-            Some(v) => v.name.clone(),
-            None => self.make.clone().unwrap_or_else(|| "Select a vehicle".into()),
-        };
-        let vehicle_vin = self.vin.as_deref().map_or("VIN not read".to_string(), |v| {
-            let keep = v.chars().count().min(11);
-            format!("{}••••••", v.chars().take(keep).collect::<String>())
-        });
-        let adapter = match &self.link {
-            Link::Online { adapter, .. } => (IconName::CircleCheck, theme.green, "Adapter connected".to_string(), adapter.clone()),
-            Link::Connecting => (IconName::Loader, theme.muted_foreground, "Connecting…".to_string(), String::new()),
-            Link::Offline(_) => (IconName::CircleAlert, theme.red, "Adapter offline".to_string(), "Retrying…".to_string()),
-        };
-
-        let nav = Page::ALL.iter().map(|&page| {
-            let on = self.page == page;
-            h_flex()
-                .id(SharedString::from(format!("nav-{}", page.label())))
-                .gap_2()
-                .px_2()
-                .h_8()
-                .items_center()
-                .rounded(theme.radius)
-                .cursor_pointer()
-                .text_color(theme.sidebar_foreground)
-                .when(on, |this| this.bg(theme.sidebar_accent).font_weight(FontWeight::SEMIBOLD))
-                .hover(|this| this.bg(theme.sidebar_accent))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.page = page;
-                    this.ensure_modules();
-                    cx.notify();
-                }))
-                .child(Icon::new(page.icon()).size_4())
-                .child(div().child(page.label()))
-                .when(page == Page::Codes && count > 0, |this| {
-                    this.child(
-                        div()
-                            .ml_auto()
-                            .min_w_5()
-                            .h_5()
-                            .px_1p5()
-                            .rounded_full()
-                            .bg(theme.primary)
-                            .text_color(theme.primary_foreground)
-                            .text_xs()
-                            .text_center()
-                            .child(count.to_string()),
-                    )
-                })
-        });
-
-        let sidebar = v_flex()
-            .w(px(232.))
-            .flex_none()
-            .h_full()
-            .gap_4()
-            .p_3()
-            .bg(theme.sidebar)
-            .border_r_1()
-            .border_color(theme.sidebar_border)
-            .child(
-                h_flex()
-                    .id("vehicle-card")
-                    .gap_2()
-                    .p_2()
-                    .items_center()
-                    .justify_between()
-                    .border_1()
-                    .border_color(theme.border)
-                    .rounded(theme.radius)
-                    .cursor_pointer()
-                    .when(self.page == Page::Vehicles, |this| this.bg(theme.sidebar_accent))
-                    .hover(|this| this.bg(theme.sidebar_accent))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.page = Page::Vehicles;
-                        this.ensure_vin();
-                        cx.notify();
-                    }))
-                    .child(
-                        v_flex()
-                            .min_w_0()
-                            .gap_0p5()
-                            .child(div().font_weight(FontWeight::SEMIBOLD).truncate().child(vehicle_title))
-                            .child(div().text_xs().text_color(theme.muted_foreground).child(vehicle_vin)),
-                    )
-                    .child(Icon::new(IconName::ChevronsUpDown).size_4().text_color(theme.muted_foreground)),
-            )
-            .child(v_flex().gap_0p5().children(nav))
-            .child(
-                h_flex()
-                    .mt_auto()
-                    .gap_2()
-                    .px_2()
-                    .items_center()
-                    .child(Icon::new(adapter.0).size_4().text_color(adapter.1))
-                    .child(
-                        v_flex()
-                            .child(div().font_weight(FontWeight::MEDIUM).child(adapter.2))
-                            .child(div().text_xs().text_color(theme.muted_foreground).child(adapter.3)),
-                    ),
-            );
-
-        let header = h_flex()
-            .justify_between()
-            .items_center()
-            .gap_3()
-            .px_6()
-            .pt_5()
-            .child(
-                v_flex()
-                    .gap_0p5()
-                    .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child(self.page.label()))
-                    .child(div().text_color(theme.muted_foreground).child(self.page_subtitle(cx))),
-            )
-            .child(self.page_actions(cx));
-
-        v_flex()
-            .size_full()
-            .bg(theme.background)
-            .child(
-                TitleBar::new().child(
-                    h_flex()
-                        .w_full()
-                        .justify_between()
-                        .items_center()
-                        .child(div().text_xs().text_color(theme.muted_foreground).child("Diagnostics"))
-                        .child(
-                            div()
-                                .mr_4()
-                                .text_xs()
-                                .text_color(if self.mil_on { theme.red } else { theme.green })
-                                .child(if self.mil_on { "● MIL on" } else { "● MIL off" }),
-                        ),
-                ),
-            )
-            .when(ask_make, |this| {
-                this.child(
-                    h_flex()
-                        .gap_3()
-                        .px_3()
-                        .py_2()
-                        .items_center()
-                        .bg(theme.yellow.opacity(0.15))
-                        .border_b_1()
-                        .border_color(theme.border)
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(theme.foreground)
-                                .child("Vehicle not recognised. Pick or add it so manufacturer-specific codes can be named."),
-                        )
-                        .child(Button::new("pick-vehicle").label("Choose vehicle").on_click(cx.listener(|this, _, _, cx| {
-                            this.page = Page::Vehicles;
-                            this.ensure_vin();
-                            cx.notify();
-                        }))),
-                )
-            })
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(sidebar)
-                    .child(v_flex().flex_1().min_w_0().h_full().child(header).child(div().flex_1().min_h_0().overflow_hidden().map(
-                        |this| match self.page {
-                            Page::Overview => this.child(self.render_overview(cx)),
-                            Page::Codes => this.child(self.render_codes(cx)),
-                            Page::Live => this.child(self.render_live(cx)),
-                            Page::Readiness => this.child(self.render_readiness_page(cx)),
-                            Page::Modules => this.child(self.render_modules(cx)),
-                            Page::Functions => this.child(self.render_functions(cx)),
-                            Page::ModuleData => this.child(self.render_module_data(window, cx)),
-                            Page::Contribute => this.child(self.render_contribute(window, cx)),
-                            Page::Vehicles => this.child(self.render_vehicles(cx)),
-                        },
-                    ))),
-            )
-            .child(
-                h_flex()
-                    .h_7()
-                    .px_3()
-                    .items_center()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .text_xs()
-                    .text_color(status_color)
-                    .justify_between()
-                    .child(status),
-            )
+        hot(|| self.render_frame(window, cx))
     }
 }
 
@@ -1970,6 +1995,15 @@ usage: canforge [options]
   bench [--count N]     time routine sweeps on the connected car (close the app first)
   db status             which trouble code data is in use
   db update [--from X]  fetch the latest vehicle-db release (checksum-verified)";
+
+/// `CANFORGE_WINDOW=1180x820` opens the window at that size (to look at the other layouts).
+fn dev_window_size() -> gpui_kit::Size<Pixels> {
+    std::env::var("CANFORGE_WINDOW")
+        .ok()
+        .and_then(|v| v.split_once('x').map(|(w, h)| (w.parse::<f32>().ok(), h.parse::<f32>().ok())))
+        .and_then(|(w, h)| Some(size(px(w?), px(h?))))
+        .unwrap_or(size(px(1280.), px(800.)))
+}
 
 fn fail(message: impl std::fmt::Display) -> ! {
     eprintln!("canforge: {message}");
@@ -2027,15 +2061,25 @@ fn main() {
     };
     let source = std::cell::Cell::new(Some(source));
 
-    gpui_kit::application().with_assets(gpui_kit::assets::Assets).run(move |cx| {
+    trace::install();
+    i18n::load();
+    units::load();
+    #[cfg(feature = "hot")]
+    {
+        dioxus_devtools::connect_subsecond();
+        subsecond::register_handler(std::sync::Arc::new(|| PATCHED.store(true, std::sync::atomic::Ordering::Relaxed)));
+    }
+    gpui_kit::application().with_assets(ui::Assets).run(move |cx| {
         gpui_kit::init(cx);
+        cx.bind_keys([KeyBinding::new("ctrl-k", OpenPalette, None), KeyBinding::new("cmd-k", OpenPalette, None)]);
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(1180.), px(760.)), cx)),
+            window_bounds: Some(WindowBounds::centered(dev_window_size(), cx)),
             ..TitleBar::window_options()
         };
         gpui_kit::open_window(options, cx, |window, cx| {
             window.set_window_title("canforge — Diagnostics");
-            Theme::change(ThemeMode::Dark, Some(window), cx);
+            load_tablet();
+            ui::apply_theme(ui::ThemePref::load(), window, cx);
             let backend = backend::spawn(source.take().expect("window opened once"));
             cx.new(|cx| Diagnostics::new(backend, make.clone(), window, cx))
         })

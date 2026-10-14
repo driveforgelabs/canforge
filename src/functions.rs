@@ -36,6 +36,23 @@ impl Function {
     pub fn needs_security(&self) -> bool {
         !self.security.is_empty() && self.security != "0"
     }
+
+    /// The system this function is about, from its title, so a module's long list can be browsed.
+    pub fn category(&self) -> &'static str {
+        const TABLE: &[(&str, &[&str])] = &[
+            ("Fuel and injectors", &["fuel", "injector", "rail", "low pressure"]),
+            ("Exhaust and emissions", &["dpf", "particulate", "regeneration", "scr", "nox", "nitrogen", "exhaust", "catalyst", "lambda", "oxygen", "adblue", "urea", "differential pressure", "emission"]),
+            ("Air, EGR and turbo", &["egr", "maf", "throttle", "etb", "turbo", "boost", "intake", "air ", "vcv", "wastegate", "swirl"]),
+            ("Engine position and timing", &["crankshaft", "camshaft", "misfire", "cylinder", "timing", "idle", "compression", "oil"]),
+            ("Brakes and steering", &["abs", "brake", "esp", "hydraulic", "steering", "yaw", "stability", "bleed", "parking"]),
+            ("Transmission", &["transmission", "shift", "gear", "clutch", "converter", "tcm", "differential", "transfer"]),
+            ("Security, keys and odometer", &["pats", "key", "immobil", "odometer", "vin", "security"]),
+            ("Body, lighting and safety", &["lock", "remote", "rf ", "headlamp", "lamp", "led", "door", "window", "seat", "tire", "tpms", "crash", "airbag", "restraint", "ocs", "wiper", "mirror", "light"]),
+            ("Module and setup", &["module", "initialization", "initialisation", "configuration", "scan for", "enter", "exit", "power", "relearn", "enable", "release", "resume", "stop", "apply", "local"]),
+        ];
+        let title = self.title.to_lowercase();
+        TABLE.iter().find(|(_, words)| words.iter().any(|w| title.contains(w))).map_or("Other", |(name, _)| name)
+    }
 }
 
 #[derive(Default)]
@@ -109,6 +126,16 @@ mod tests {
         assert_eq!(rows[2].routine, "");
         assert!(!rows[2].runnable && rows[2].routine_id().is_none());
         assert!(f.for_module(0x720).is_empty());
+    }
+
+    #[test]
+    fn sorts_titles_into_systems() {
+        let f = |t: &str| Function { title: t.into(), routine: String::new(), reads: String::new(), writes: String::new(), session: None, security: String::new(), engine_mode: None, runnable: false, option: vec![] };
+        assert_eq!(f("Reset Fuel Injector Adaptation - Cylinder 2").category(), "Fuel and injectors");
+        assert_eq!(f("Reset EGR Valve Adaptations").category(), "Air, EGR and turbo");
+        assert_eq!(f("Reset Differential Pressure Sensor Learned Values").category(), "Exhaust and emissions");
+        assert_eq!(f("Calibrate Steering Angle Sensor").category(), "Brakes and steering");
+        assert_eq!(f("Something unusual").category(), "Other");
     }
 
     #[test]
