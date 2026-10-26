@@ -188,14 +188,16 @@ parity rule as in §SlowInit). KW bytes come back at **response offsets 4–5**;
 divisor`** where `0x1C2000` = 1843200 (FTDI base clock) and `divisor` = response bytes 2–3. So on the
 KC stack the baud is reported as a divisor, not a raw rate.
 
-**The one piece still open:** the ECU **measuring-block/fault-code passthrough** for an HC-stack FTDI
-unit. The high-level ECU-block layer (`FUN_0045935c` cmd `0x49`/`0x0005` → `FUN_0045a9fa`) transmits
-**only for `fedc==7/8`** (confirmed — no socket/HID handle for `fedc 0–3`), and the KC stack carries
-interface commands (`D`/`I` init, `0x74` K-line test, `0x22` security upload), not raw ECU blocks.
-I could not isolate the exact function that hands an ECU KW1281 block to an HC-stack FTDI unit. If
-your init is HC (`84…`) but block exchange stalls, this is why; fall back to driving KW1281 to the
-**ISO 9141 / KW1281 standard** over the byte transport (the interface does the per-byte complement —
-B3).
+**ECU measuring-block / fault-code passthrough — resolved to a binary-proven negative.** The ECU-block
+message layer has exactly two senders, `FUN_0045935c` and `FUN_004595a7` (53 call sites total); both
+feed `FUN_0045a9fa` / `FUN_0045adca`, and **both transmit only for `fedc==8` (HID handle at obj+0x1EC)
+or the HEX-NET socket** — a byte-grep of both functions finds **zero** FTDI send calls
+(`FUN_004cd16c`/`FUN_004bb17f`/`FUN_004bb1b6`). FTDI is `fedc 0–3`. **Therefore VCDS 26.9 has no ECU
+measuring-block/fault-code passthrough over the FTDI interface — it is provably absent from the
+binary, not merely unlocated.** (Consistent with Ross-Tech having deprecated the HEX-USB+CAN: this
+build does init/identify/CAN/KC-commands over it, but routes full ECU block diagnostics only to
+HEX-V2/HEX-NET.) A from-scratch client must drive the KW1281 block loop itself (standard; the
+interface does the per-byte complement — B3).
 
 ### HC opcode map (sent via vtable +0x88, confirmed from `FUN_*` buffer writes)
 
@@ -241,16 +243,20 @@ originates in the **interface firmware** (which isn't in this binary) and VCDS s
 Behaviour fits an interface idle-prompt while it waits for the host to proceed — respond (KC frame,
 or the standard KW1281 keyword-complement + first ACK) and see if the train stops.
 
-**Q (C5): first host action + block-counter start?** [C for the KC init sequence; standard for the
-block loop] On the KC stack (`FUN_0046c702`), the first host frames after bus detect are the init
-pair **`D` (`44 <mode> 00`)** then **`I` (`49 <addr|parity>`)**; the interface then returns the KW
-pair and does the 5-baud/keyword-complement handshake itself (no host keyword-complement byte on this
-stack — B3). After that, the KW1281 **block loop follows the standard**: ECU sends block 1
-(`block_counter = 1`), host replies counter 2 — normally an ACK block `03 02 09 03`
-(`len=03, ctr=02, title=09 ACK, end=03`) — and the counter increments by 1 per block, the two sides
-alternating. You exchange whole blocks `[title][data…]`; the interface handles the per-byte
-complement, so track only the counter. (No VCDS-specific "first measuring block" exists in the binary
-for FTDI beyond this — the loop is standard KW1281.)
+**Q (C5): first host action + block-counter start?** The binary-backed part: on the KC stack
+(`FUN_0046c702`) the first host frames after bus detect are the init pair **`D` (`44 <mode> 00`)**
+then **`I` (`49 <addr|parity>`)**, and the interface returns the KW pair and runs the
+5-baud/keyword-complement handshake itself.
+
+The deeper binary fact about the block loop: **VCDS does not contain a KW1281 byte-level block loop at
+all.** There is no host-side complement (`^0xff`) loop anywhere (B3), no block-counter increment in
+the K-line send code, and no `03 .. 09 03` ACK-block builder in the binary. VCDS delegates the entire
+block framing — counter, complement, ACK, `0x03` terminator, timing — to the **interface firmware**
+(which is not in this executable). So the "first block / counter start / ACK bytes" are **not
+recoverable from the VCDS binary**, because VCDS never sees or builds them; it exchanges whole blocks
+with a firmware that does the KW1281 framing. The implementable values are therefore the **KW1281
+standard**: ECU block 1 (`counter = 1`), host ACK `03 02 09 03`, counter +1 per block. This is the
+spec to code to — not a VCDS-specific variant, because none exists in the binary.
 
 **Q: CAN / `0x50` TEA on this older unit?** [I] Host code is not transport-gated, so VCDS issues the
 same `CANOpenCtrl`/`0x11`/`0x50` sequence over FTDI; whether the firmware answers `0x50` is the
