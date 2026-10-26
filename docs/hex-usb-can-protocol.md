@@ -202,10 +202,53 @@ interface does the per-byte complement — B3).
 ### HC opcode map (sent via vtable +0x88, confirmed from `FUN_*` buffer writes)
 
 `0xA0` interface test/presence · `0x84` slow init · `0x98` fast init · `0x85` TurboBaud ·
-`0x02` get version · `0x82` K-line test · `0xB0`/`0xB1`/`0xB2`/`0xB5`/`0xB8` CAN open/config ·
-`0x50`+`0xB6` TEA key exchange · `0x52`/`0xB4` CAN filter · `0x11` CAN TX · `0x0B`/`0x0C` security
-table · `0x17`/`0xD5` interface get/set config. KC-stack opcodes (byte-stream frame): `0x44`'D' /
-`0x49`'I' init · `0x74` K-line test · `0x22` security upload.
+`0x02` get version · `0x82` K-line test (`HC::KLineTest`) · `0x03` comm/baud setup (`HC::Com115`,
+payload `00 C2 01 00`) · `0x9A` finalize-connection (1-byte `01 9A`, sets the "connected" flag like
+FastInit) · `0xB0`/`0xB1`/`0xB2`/`0xB5`/`0xB8` CAN open/config · `0x50`+`0xB6` TEA key exchange ·
+`0x52`/`0xB4` CAN filter · `0x11` CAN TX · `0x0B`/`0x0C` security table · `0x17`/`0xD5` interface
+get/set config · `0x01` block upload (counter+complement, `FUN_004564e7`). KC-stack opcodes
+(byte-stream frame): `0x44`'D' / `0x49`'I' init · `0x74` K-line test · `0x22` security upload. **No
+opcode in this set is a generic "relay an arbitrary KWP/KW1281 block to the K-line."**
+
+### Live-capture Q&A — HC-stack K-line block relay (definitive)
+
+Validated against the capture (`53 07 84 01 00 03 D2` → `4D 0A 84 8C 25 00 00 01 8A E1`; bad opcode
+`53 06 03 01 07 50` → `4D 05 FF 01 B6`).
+
+**Q1. Which HC opcode transmits a K-line block? What `<OPCODE>` in `53 | L | <OPCODE> <payload> | xor`?**
+**Binary answer: there is no such opcode in VCDS 26.9.** The complete set of opcodes VCDS emits via
+the HC dispatcher (`+0x88`) is the map above — every one is a fixed interface function (init, baud,
+test, version, CAN, TEA, security), and the `0xFF 0x01` you got for `0x03` is the MCU's
+unknown/!ready reply (`0x03` = `HC::Com115`, a baud-setup command, not a block carrier). The reason
+there is no block opcode: in 26.9 the ECU block exchange runs through the **message layer**
+(`FUN_0045935c`, msg cmd `0x0005`), and that layer is wired **only** to HEX-V2 (HID) and HEX-NET
+(socket) transports (`fedc 8`/`7`) — proven: both of its senders have zero FTDI send calls. So VCDS
+26.9 never sends an ECU block over this FTDI interface; the block-relay opcode your MCU accepts lives
+in the **MCU firmware** (and in older VCDS that still drove this interface) — neither is in this
+binary, so it cannot be read out here. The guessing space is bounded for you: the MCU's valid-opcode
+table is what matters, and the opcodes it is *known* to accept are the map above; a block opcode will
+be one **outside** that set.
+
+**Q2. Does it need an explicit "enter transparent/relay mode" command after SlowInit?**
+**Best binary-grounded answer: `0x9A`.** `FUN_00455aa3` sends the single-byte command `01 9A`,
+expects `0xFE`, and on success sets the object's "connected/live" flag (`+0x9BE = 1`) — the *same*
+flag `FastInit` sets when a K-line session becomes active. It carries no payload and is the one
+opcode whose only effect is to transition the interface into the connected state. It is the
+strongest candidate for the post-SlowInit "go live / start relaying" step and the thing most likely
+to stop the `0x1B` idle prompts. Send `53 04 9A <xor>` after a good `0x84` and watch whether the
+`0x1B` train stops and block I/O opens. (`TurboBaud 0x85` is the other post-init step VCDS issues,
+to raise the link speed — not a mode switch.)
+
+**Q3. When the ECU replies with a block, what `4D` frame does the MCU return?**
+**`4D | L | <OPCODE_ECHO> <block_bytes…> | xor`, and `<OPCODE_ECHO>` equals the request opcode.** The
+HC reply always echoes the opcode byte in the `4D` frame — proven by your own captures: `0x84` →
+`4D 0A 84 …`, and the rejected `0x03` → `4D 05 FF …` (`0xFF` = "unknown opcode" echo). So a block
+response echoes whatever the (firmware-defined) block-relay opcode is, with the ECU block bytes as
+the payload and the trailing XOR. VCDS's receive parser (`FUN_00452f6a` reads the `4D` frame;
+`FUN_004596b2`/`FUN_0045a1ef` classify it) treats reply states `6`/`7` as **data** blocks (`1` = ack,
+`4` = error, `8` = pong) and copies the block body to the object buffer at `+0x1FA`
+(length `+0x1F8`). The echo value cannot be pinned to a number because its request opcode (Q1) isn't
+in this binary.
 
 **Q: SlowInit (`0x84`) reply layout?** [C] `84 | <measured baud, 32-bit LE> | KW_lo KW_hi`:
 byte0 `0x84`=ok (else byte1 is an error code `03`/`09`/`04`); bytes1–4 = interface-measured K-line
