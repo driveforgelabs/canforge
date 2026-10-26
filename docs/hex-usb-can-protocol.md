@@ -142,15 +142,37 @@ explained by the latency timer). What genuinely remains needs the device:
 
 Concrete answers for implementing KW1281 over this interface. Evidence tags as elsewhere.
 
-**Q: Does the host or the interface MCU do the KW1281 byte-level complement-ack / pacing?**
-**The MCU.** [C] The host sends a whole block as one diagnostic payload
-(`FUN_0045a3eb`/`FUN_0045a6fa` → `FUN_0045935c(5, block+1, len)`, message cmd `0x0005`) and reads a
-whole block back; there is **no per-byte `XOR 0xFF` loop in the host**. Implement it as: send
-`[block_title][data…]` (length-prefixed), receive `[title][data…]`; let the interface handle the
-complemented, `0x03`-terminated byte stream and 5-baud. The **block counter** is state you track and
-place in the block. (`FUN_0045935c`'s first arg is the *message cmd*; `5` = diagnostic passthrough,
-**not** a K-line opcode. The `FUN_004596b2` "cmd 7" path is KWP/UDS negative-response handling
-(`7F .. 11`), not the KW1281 relay — ignore it for KW1281.)
+> **Correction (supersedes an earlier draft of this section).** An earlier version said the KW1281
+> block relay goes through message cmd `0x0005` (`FUN_0045a3eb`/`FUN_0045a6fa` → `FUN_0045935c` →
+> `FUN_0045a9fa`) and that the MCU does the complement. On re-tracing, **that `0x0005` CB-block
+> mechanism transmits only over TCP/HID** — `FUN_0045a9fa` dispatches to `send()` (fedc==7) or
+> `FUN_004d37f3` (HID handle at obj+0x1EC) and has **no FTDI branch**. So that path is the
+> HEX-V2 / HEX-NET relay, **not** this FTDI interface. The claim is retracted for HEX-USB+CAN.
+
+**Q (A1/A2): KW1281 block wire shape on *this* (FTDI) interface?**
+
+*Transport frame — [C].* The interface object's dispatch table is at base `0x5AE910`:
+**`+0x88` = `FUN_00452ea9` (HC::SendCommand), `+0x8C` = `FUN_00452f6a` (HC receive)** (verified: both
+pointers sit at `0x5AE998`/`0x5AE99C`). On FTDI, `+0x88` → `FUN_004bb17f` → `FUN_004cd16c`
+`WriteFile`, and `+0x8C` → `FUN_00452f6a` → `FUN_00470267` → `FUN_004cd1c1` `ReadFile`. So every
+command/response is an HC frame: **send `53 | L | payload | xor`, receive `4D | L | payload | xor`**
+(`L` = framelen, `xor` over all preceding bytes, seed `0x53`/`0x4D`).
+
+*Receive block layout — [C].* A parsed response block lands in the interface object: **body at
+`+0x1FA`, length at `+0x1F8`, reply-cmd/title indicator at `+0x1F4`** (`FUN_0045a1ef`/`FUN_004596b2`
+populate these; callers read `[len][body…]`). The body is the ECU block payload **`[title][data…]`**
+— the `4D` frame wrapper (and its `xor`) and the KW1281 per-byte complements are already stripped
+before this point. So on receive you get clean `[title][data…]`, **not** `[len][seq]` and not the
+complement bytes.
+
+*Send block — [I], with an honest limit.* This VCDS 26.9 build's **high-level diagnostic-session
+loop** (`FUN_0045dc1d` → `FUN_0045935c(0x49,…)` connect, then `FUN_004596b2` receive) uses the
+`0x0005`/`0x49` **message layer, which transmits only over TCP/HID** (`FUN_0045935c`→`FUN_0045a9fa`,
+no FTDI branch — confirmed). I could **not** locate a separate FTDI KW1281 block *sender* in the
+dumped ranges (`FUN_00452ea9` is vtable-only, no direct callers), so the exact FTDI block-send
+function/opcode is **not established statically**. Best-grounded inference: a block is sent as an HC
+command `53 | L | <block payload> | xor` via `+0x88`, symmetric to the confirmed receive. Treat the
+send *opcode* as unconfirmed and pin it from your capture (it is the byte VCDS puts right after `L`).
 
 **Q: SlowInit (`0x84`) reply layout?** [C] `84 | <measured baud, 32-bit LE> | KW_lo KW_hi`:
 byte0 `0x84`=ok (else byte1 is an error code `03`/`09`/`04`); bytes1–4 = interface-measured K-line
@@ -170,10 +192,38 @@ KWP/CAN paths) — confirm against the capture. Per-op timeouts are written to `
 each transact (e.g. `0xCE4`=3300, `0x2EE`=750); the ~1 s inter-block keep-alive (`3C` block) is
 host-side and best taken from your capture.
 
+**Q (B3): after SlowInit, who does the KW1281 byte-level complement / KW2-complement — host or MCU?**
+**The interface MCU — [C, by absence].** I searched the entire K-line/command code
+(`vcds.hc.c`/`vcds.kc.c`/`vcds.kc2.c`) for a host-side complement (`^ 0xff`, `~b`, `0xff - b`) around
+the byte read/write primitives (`FUN_00470267`/`FUN_004bb1b6`) and there is **none**. Combined with
+the interface doing 5-baud init + baud measurement itself (§SlowInit), the byte-level complement-ack
+and inter-byte timing are done **in the interface**, not the host. You exchange whole blocks
+(`[title][data…]`) and never send per-byte complements or drive DTR/RTS/BREAK for the ack (those
+primitives — `FUN_004cd255`/`2b6`/`471` — exist but are used for reset/line-state, not the KW2
+handshake).
+
+**Q (B4): the `0x1B` bytes emitted ~3× every ~116 ms right after SlowInit?** [?] **Unknown — no
+static evidence.** `0x1B` is not a value I can tie to any opcode/field in the analyzed code, and I
+will not guess. It is most likely an interface-level prompt/keepalive while it waits for the host to
+proceed, but confirm empirically: try responding (with the first block, or a `3C` keep-alive) and see
+whether the `0x1B` train stops.
+
+**Q (C5): first host block + block-counter start?** [?] **Not determined statically** (depends on
+the untraced FTDI block packager). KW1281 convention is that the ECU sends block 1 first (its
+keyword/ID blocks) and the host replies with the matching counter+1; VCDS's usual first host action
+is an ACK (`03 <ctr> 09 03`) or a read. **Take the exact first block and counter from your capture** —
+it is authoritative and avoids relying on an inference here.
+
 **Q: CAN / `0x50` TEA on this older unit?** [I] Host code is not transport-gated, so VCDS issues the
 same `CANOpenCtrl`/`0x11`/`0x50` sequence over FTDI; whether the firmware answers `0x50` is the
 hardware unknown. If CAN open stalls, assume no `0x50` and try unmasked CAN frames. K-line needs none
 of this.
+
+> **For the byte-level KW1281 questions (A1/A2/B3/B4/C5): your live capture is better evidence than
+> this static analysis.** The code confirms the transport (FTDI byte stream, `53`/`4D` HC frames) and
+> the SlowInit handshake, but the older FTDI diagnostic/block driver was not fully traced. If you want
+> the static answer anyway, the next RE step is to locate the interface object's vtable +0x88/+0x8C
+> targets for the K-line session and the KW1281 block packager — ask and I'll trace it.
 
 ---
 
