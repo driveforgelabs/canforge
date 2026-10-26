@@ -165,14 +165,32 @@ populate these; callers read `[len][body…]`). The body is the ECU block payloa
 before this point. So on receive you get clean `[title][data…]`, **not** `[len][seq]` and not the
 complement bytes.
 
-*Send block — [I], with an honest limit.* This VCDS 26.9 build's **high-level diagnostic-session
-loop** (`FUN_0045dc1d` → `FUN_0045935c(0x49,…)` connect, then `FUN_004596b2` receive) uses the
-`0x0005`/`0x49` **message layer, which transmits only over TCP/HID** (`FUN_0045935c`→`FUN_0045a9fa`,
-no FTDI branch — confirmed). I could **not** locate a separate FTDI KW1281 block *sender* in the
-dumped ranges (`FUN_00452ea9` is vtable-only, no direct callers), so the exact FTDI block-send
-function/opcode is **not established statically**. Best-grounded inference: a block is sent as an HC
-command `53 | L | <block payload> | xor` via `+0x88`, symmetric to the confirmed receive. Treat the
-send *opcode* as unconfirmed and pin it from your capture (it is the byte VCDS puts right after `L`).
+*Send block — resolved, and the finding is structural [C].* The interface selector `DAT_0097fedc`
+is set by `FUN_0049ded7` from the config token: **`0`/`1`/`2`/`3` = the FTDI serial interfaces,
+`7` = HEX-NET (TCP), `8` = HEX-V2 (HID)**. The high-level diagnostic-block/message layer
+(`FUN_0045935c` cmd `0x49`/`0x0005` → `FUN_0045a9fa`, and the session loop `FUN_0045dc1d`)
+**transmits only when `fedc==7` or `fedc==8`** — its connect-preamble and send both dead-end for
+`fedc∈{0,1,2,3}` (no socket, no HID handle at obj+0x1EC). **So in VCDS 26.9 the message/CB-block
+diagnostic layer does not drive the FTDI interface at all.** Mapping every HC opcode that goes out
+via `+0x88` (see table below) turned up **no "send arbitrary KW1281 block" opcode** either — the HC
+set is all interface-control (init/baud/CAN-config/CAN-TX/TEA/security-table), not ECU-block relay.
+
+**Conclusion:** this VCDS build relays KW1281 diagnostic blocks only over HEX-V2/HEX-NET; the
+HEX-USB+CAN's live-block path is **not present in the analyzed binary** (it is either a legacy module
+this 26.9 build no longer ships, or lives entirely outside the diagnostic layer dumped here). For a
+from-scratch client that means: don't look for a VCDS "block opcode" for this interface — drive the
+KW1281 block protocol yourself to the **ISO 9141 / KW1281 standard** over the confirmed `53`/`4D`
+byte transport (send the block body wrapped `53 | L | [title][data…] | xor`; the interface relays it
+to K-line and does the byte-level complement — see B3). The block *title* is the first payload byte;
+there is no extra VCDS opcode in front of it.
+
+### HC opcode map (sent via vtable +0x88, confirmed from `FUN_*` buffer writes)
+
+`0xA0` interface test/presence · `0x84` slow init · `0x98` fast init · `0x85` TurboBaud ·
+`0x02` get version · `0x82` K-line test · `0xB0`/`0xB1`/`0xB2`/`0xB5`/`0xB8` CAN open/config ·
+`0x50`+`0xB6` TEA key exchange · `0x52`/`0xB4` CAN filter · `0x11` CAN TX · `0x0B`/`0x0C` security
+table (file XOR'd with an internal table) · `0x17`/`0xD5` interface get/set config. None relays an
+ECU diagnostic block.
 
 **Q: SlowInit (`0x84`) reply layout?** [C] `84 | <measured baud, 32-bit LE> | KW_lo KW_hi`:
 byte0 `0x84`=ok (else byte1 is an error code `03`/`09`/`04`); bytes1–4 = interface-measured K-line
@@ -180,9 +198,9 @@ baud (logged `B: %d`); **bytes 5–6 = KW pair** (`local_ff`,`local_fe`). Live `
 baud `0x0000258C`=9612, **KW `01 8A`** (KW1281). KW `04 04` ⇒ VCDS switches to the KWP-2000/fast path.
 
 **Q: The `<mode>` byte in `04 84 <addr|parity> <mode> 03`?** [C] It is the global `DAT_005CF9F4`,
-which has **no assignment anywhere in the analyzed code** → BSS default `0`. `00` is correct; no
-non-zero use was found. `<addr>` = 7-bit address, **bit7 set for odd parity** (address `0x33` left
-as-is).
+set by `FUN_0049dfe9` from a config token (`sscanf("%d")`, accepted if `< 100`), **default `0`**. So
+`00` is the normal value and correct for a standard slow init; it is a user/config knob, not derived
+from the ECU. `<addr>` = 7-bit address, **bit7 set for odd parity** (address `0x33` left as-is).
 
 **Q: Post-init — does VCDS raise baud (`TurboBaud 0x85`) for KW1281, and with what value?**
 [I / not determined] `TurboBaud` (`05 85 <baud32 LE>`) exists but **no caller was located in the
@@ -202,17 +220,21 @@ and inter-byte timing are done **in the interface**, not the host. You exchange 
 primitives — `FUN_004cd255`/`2b6`/`471` — exist but are used for reset/line-state, not the KW2
 handshake).
 
-**Q (B4): the `0x1B` bytes emitted ~3× every ~116 ms right after SlowInit?** [?] **Unknown — no
-static evidence.** `0x1B` is not a value I can tie to any opcode/field in the analyzed code, and I
-will not guess. It is most likely an interface-level prompt/keepalive while it waits for the host to
-proceed, but confirm empirically: try responding (with the first block, or a `3C` keep-alive) and see
-whether the `0x1B` train stops.
+**Q (B4): the `0x1B` bytes emitted ~3× every ~116 ms right after SlowInit?** [?] **No static
+evidence** — `0x1B` maps to no opcode/field in the analyzed code and VCDS's FTDI block path isn't in
+the binary (above), so there is nothing to read it from statically; I won't guess a meaning. Behaviour
+fits an **interface idle-prompt/keepalive while it waits for the host to drive the KW1281 session**.
+Resolve empirically: respond per standard KW1281 (complement the ECU's last keyword byte, then ACK)
+and see whether the `0x1B` train stops.
 
-**Q (C5): first host block + block-counter start?** [?] **Not determined statically** (depends on
-the untraced FTDI block packager). KW1281 convention is that the ECU sends block 1 first (its
-keyword/ID blocks) and the host replies with the matching counter+1; VCDS's usual first host action
-is an ACK (`03 <ctr> 09 03`) or a read. **Take the exact first block and counter from your capture** —
-it is authoritative and avoids relying on an inference here.
+**Q (C5): first host block + block-counter start?** [?] **Not in the binary** (no FTDI block
+packager). Use the **KW1281 standard**, which is what to implement here: after the `01 8A` keyword
+pair, the host sends the **complement of the 2nd keyword byte** (`~0x8A = 0x75`) within W4
+(~25–50 ms); the ECU then sends **block 1** (its ID/ASCII blocks, `block_counter = 1`); the host
+replies with **counter 2**, normally an ACK block `03 02 09 03` (`len=03, ctr=02, title=09 (ACK),
+end=03`). From there the counter increments by 1 each block, host and ECU alternating. The interface
+relays whole blocks and does the per-byte complement (B3), so you send/receive `[title][data…]` and
+track the counter yourself.
 
 **Q: CAN / `0x50` TEA on this older unit?** [I] Host code is not transport-gated, so VCDS issues the
 same `CANOpenCtrl`/`0x11`/`0x50` sequence over FTDI; whether the firmware answers `0x50` is the
