@@ -203,10 +203,16 @@ bits[1:0] = K-line line state, bits[3:2] = CAN state (logged as `0xD2`/`0xD4`/`0
 Two inits, both via the HC channel:
 
 - **Slow / address init (KW1281 + KWP slow)** — `FUN_00452b94`, opcode **`0x84`**:
-  buffer `04 84 <addr> <mode> 03`. `<addr>` is the 7-bit module address with **bit 7 set for odd
-  parity** (VCDS counts the parity of the address; address `0x33` is left as-is). `<mode>` comes from
-  `DAT_005CF9F4`. Reply `0x84` = success, with the two **keyword (KW) bytes** in reply bytes 2–3
-  (VCDS logs `KW: %02X%02X`); `04 04` keyword pair marks a KWP-2000-capable ECU.
+  buffer `04 84 <addr> <mode> 03` (inner length `0x04`). `<addr>` is the 7-bit module address with
+  **bit 7 set for odd parity** (VCDS counts the parity of the address; address `0x33` is left as-is).
+  `<mode>` comes from the global `DAT_005CF9F4`, which has no assignment in the analyzed code and
+  defaults to `0` (so `00` is the normal value). Reply layout (confirmed from the stack offsets in
+  `FUN_00452b94`): **`84 | <measured baud, 32-bit little-endian> | KW_lo KW_hi`**. Reply[0]=`0x84`
+  success; reply[1..4] is the interface's measured K-line baud (VCDS logs it as `B: %d`, e.g.
+  `8C 25 00 00` = `0x0000258C` = 9612); **the KW pair is reply bytes 5–6** (VCDS logs `KW: %02X%02X`
+  from `local_ff`,`local_fe` = reply[5],reply[6]). Example live reply `84 8C 25 00 00 01 8A` → baud
+  9612, **KW = `01 8A`** (standard KW1281). A `04 04` KW pair makes VCDS switch to the KWP-2000/fast
+  path. When reply[0] ≠ `0x84`, reply[1] is an error code (`03`/`09`/`04`).
 - **Fast init (KWP2000)** — `HC::FastInit`, opcode **`0x98`** carrying StartCommunication
   `C1 33 F1 81 66` (section 5).
 - **`HC::TurboBaud`** (`0x85`) then raises the K-line baud after init.
@@ -269,8 +275,16 @@ are not additional HEX-V2 opcodes.
 2. Then a byte-level block loop, each byte echoed as its **one's-complement** by the receiver:
    `[block_len] [block_counter] [block_title] [data…] [0x03 end]`. `block_counter` increments by 1
    each block and wraps. Common titles: `0x3C` ACK/keep-alive, `0xF6` ASCII data, `0x09` ack,
-   `0x07` fault codes, `0x06` end-output. VCDS runs this loop in software; the interface just relays
-   bytes (reply cmd 7 path in `FUN_004596b2`).
+   `0x07` fault codes, `0x06` end-output.
+
+   **Who does the byte-level complement/pacing: the interface MCU, not the host.** The host sends a
+   whole block as one diagnostic payload (`FUN_0045a3eb`/`FUN_0045a6fa` → `FUN_0045935c(5, block+1,
+   len)`, i.e. message cmd `0x0005`) and reads a whole response block back; there is **no per-byte
+   XOR-`0xFF` complement loop in the host code**. So a client sends/receives complete KW1281 blocks
+   and lets the interface handle the inter-byte complement-ack and 5-baud/timing. The block body it
+   passes is `[block_title][data…]` with a length prefix; the block counter is protocol state the
+   host tracks. (`FUN_0045935c`'s first arg is the message cmd; `5` = diagnostic passthrough, not a
+   K-line opcode.)
 
 ### KWP2000 / KW2000 (K-line, ISO 14230)  [std]
 

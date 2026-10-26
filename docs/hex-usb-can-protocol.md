@@ -138,6 +138,45 @@ explained by the latency timer). What genuinely remains needs the device:
    address, and — if CAN is present — attempt `CANOpenCtrl`/`0x50` and watch whether the interface
    requires the TEA exchange.
 
-Raw decompiler output backing this doc: `re-work/vcds.sio.c`, `vcds.ftdi.c`, `vcds.hid2.c`
-(FTDI open/config, `FUN_004cd*` I/O), plus the shared command-layer dumps referenced by
-hex-v2-protocol.md. Not intended for commit.
+## 8. K-line implementation Q&A (for the Roomster bring-up)
+
+Concrete answers for implementing KW1281 over this interface. Evidence tags as elsewhere.
+
+**Q: Does the host or the interface MCU do the KW1281 byte-level complement-ack / pacing?**
+**The MCU.** [C] The host sends a whole block as one diagnostic payload
+(`FUN_0045a3eb`/`FUN_0045a6fa` → `FUN_0045935c(5, block+1, len)`, message cmd `0x0005`) and reads a
+whole block back; there is **no per-byte `XOR 0xFF` loop in the host**. Implement it as: send
+`[block_title][data…]` (length-prefixed), receive `[title][data…]`; let the interface handle the
+complemented, `0x03`-terminated byte stream and 5-baud. The **block counter** is state you track and
+place in the block. (`FUN_0045935c`'s first arg is the *message cmd*; `5` = diagnostic passthrough,
+**not** a K-line opcode. The `FUN_004596b2` "cmd 7" path is KWP/UDS negative-response handling
+(`7F .. 11`), not the KW1281 relay — ignore it for KW1281.)
+
+**Q: SlowInit (`0x84`) reply layout?** [C] `84 | <measured baud, 32-bit LE> | KW_lo KW_hi`:
+byte0 `0x84`=ok (else byte1 is an error code `03`/`09`/`04`); bytes1–4 = interface-measured K-line
+baud (logged `B: %d`); **bytes 5–6 = KW pair** (`local_ff`,`local_fe`). Live `84 8C 25 00 00 01 8A` →
+baud `0x0000258C`=9612, **KW `01 8A`** (KW1281). KW `04 04` ⇒ VCDS switches to the KWP-2000/fast path.
+
+**Q: The `<mode>` byte in `04 84 <addr|parity> <mode> 03`?** [C] It is the global `DAT_005CF9F4`,
+which has **no assignment anywhere in the analyzed code** → BSS default `0`. `00` is correct; no
+non-zero use was found. `<addr>` = 7-bit address, **bit7 set for odd parity** (address `0x33` left
+as-is).
+
+**Q: Post-init — does VCDS raise baud (`TurboBaud 0x85`) for KW1281, and with what value?**
+[I / not determined] `TurboBaud` (`05 85 <baud32 LE>`) exists but **no caller was located in the
+dumped ranges** (indirect dispatch). KW1281 is a 9600-class protocol and the interface already
+reported ~9612, so the expectation is **no TurboBaud for plain KW1281** (it is used on the faster
+KWP/CAN paths) — confirm against the capture. Per-op timeouts are written to `DAT_005D31C8` before
+each transact (e.g. `0xCE4`=3300, `0x2EE`=750); the ~1 s inter-block keep-alive (`3C` block) is
+host-side and best taken from your capture.
+
+**Q: CAN / `0x50` TEA on this older unit?** [I] Host code is not transport-gated, so VCDS issues the
+same `CANOpenCtrl`/`0x11`/`0x50` sequence over FTDI; whether the firmware answers `0x50` is the
+hardware unknown. If CAN open stalls, assume no `0x50` and try unmasked CAN frames. K-line needs none
+of this.
+
+---
+
+Raw decompiler output backing this doc: `re-work/vcds.sio.c`, `vcds.ftdi.c`, `vcds.open.c`,
+`vcds.hid2.c`, `vcds.hc.c`, `vcds.kc2.c` (FTDI open/config, `FUN_004cd*` I/O, SlowInit, block send),
+plus the shared command-layer dumps referenced by hex-v2-protocol.md. Not intended for commit.
