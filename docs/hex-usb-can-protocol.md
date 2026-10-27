@@ -233,11 +233,16 @@ be one **outside** that set.
 **Best binary-grounded answer: `0x9A`.** `FUN_00455aa3` sends the single-byte command `01 9A`,
 expects `0xFE`, and on success sets the object's "connected/live" flag (`+0x9BE = 1`) — the *same*
 flag `FastInit` sets when a K-line session becomes active. It carries no payload and is the one
-opcode whose only effect is to transition the interface into the connected state. It is the
-strongest candidate for the post-SlowInit "go live / start relaying" step and the thing most likely
-to stop the `0x1B` idle prompts. Send `53 04 9A <xor>` after a good `0x84` and watch whether the
-`0x1B` train stops and block I/O opens. (`TurboBaud 0x85` is the other post-init step VCDS issues,
-to raise the link speed — not a mode switch.)
+opcode whose only effect is to transition the interface into the connected state.
+
+**Verified (corrects the above):** `0x9A` is the **FastInit** "go live" step, **not** a slow-init
+step. In the connect function `FUN_00485513` the only call to the `0x9A` sender (vtable `+0x4C`) is
+immediately after the **"FI Success"** (fast-init) branch. The **slow-init path does not call it**:
+`FUN_00485513` → `"5BI…"` → `FUN_00469fc4` → **`HexInit` (vtable +0x18)** → `FUN_00452b94` (`0x84`),
+and when `HexInit` returns the connect function **issues no further write to the interface** (it
+updates the GUI and returns). So after a `0x84` slow init, VCDS 26.9 sends the interface **nothing
+more** in the connect flow — no `0x9A`, no block. (`0x9A` is still worth a try on your bench as a
+"go live", but understand it is the fast-init finalizer, and VCDS does not use it after `0x84`.)
 
 **Q3. When the ECU replies with a block, what `4D` frame does the MCU return?**
 **`4D | L | <OPCODE_ECHO> <block_bytes…> | xor`, and `<OPCODE_ECHO>` equals the request opcode.** The
@@ -323,12 +328,17 @@ branches solely on `DAT_0097facc`** (`==2` → CAN, whole-frame; else → K-line
 has **zero** `+0x9BE` references. So VCDS does not gate dispatch on the connected flag — "only `0x84`
 answers after `0x9A`" is the **MCU firmware's** state machine, not a host-side routing change.
 
-**Q2. What emits the `0x1B` train, and does any host write stop it?** The `0x1B` bytes are **not
-referenced anywhere in VCDS** (re-confirmed across all K-line sources) — VCDS neither emits nor
-consumes them, so they are **interface-firmware** output. After SlowInit VCDS writes **no raw stream
-payload**; its next output is always a framed command. There is no secret "write-this-to-the-stream"
-step in VCDS — the only thing that changes interface state post-init is a framed HC command
-(`0x9A` finalize is the best candidate, per the previous section).
+**Q2. What emits the `0x1B` train, and does any host write stop it?** **Verified:** after a `0x84`
+slow init, **VCDS's connect flow writes nothing further to the interface.** Traced end-to-end:
+`FUN_00485513` (connect) → `FUN_00469fc4` → `HexInit` (vtable +0x18) → `FUN_00452b94` (`0x84`); on
+return `FUN_00469fc4` and `FUN_00485513` only update the GUI and return — **no post-init frame, no
+`0x9A`, no raw byte**. And `0x1B` is referenced **nowhere** in VCDS, so the MCU emits it on its own.
+**Conclusion:** there is no VCDS-side write that stops the `0x1B` train on the slow-init path, because
+VCDS 26.9 does not continue to block diagnostics over this interface after init — the next block
+request would go through the fedc-7/8 message layer, which can't transmit on FTDI. The `0x1B` train
+is the MCU idling after a successful init that this VCDS build never follows up on. (On the *fast*-init
+path VCDS does send `0x9A` right after success — that is the only post-init interface write in the
+connect code, and it is fast-init-only.)
 
 **Q3. Does VCDS ever write plain (non-`53`-framed) bytes on the FTDI stream — decisive via
 `FUN_004cd118` callers?** **Decisively: exactly one raw byte, `0xA5`, and only pre-init.**
@@ -348,9 +358,14 @@ before the first byte:** `FUN_004bb22f` → `FUN_004cd0bd` (set comm state/baud)
 'C')` = **clear DTR** + `FUN_004bb20f(fedc,'C')` = **clear RTS**; then `FUN_004bb20f(fedc,'S')` =
 **set RTS**; then **~135-unit delay** (`FUN_004704b6(0x87)`); then `FUN_004bb163` = **flush RX**; then
 the bytes stream out; afterwards `~20` delay + **clear RTS**. Net line state during the frame:
-**DTR = low, RTS = high, with a ~135 ms settle after raising RTS**. Silence with `mode=00` most
-likely means the **RTS-high + settle + flush preamble** (not the mode byte) was missing. No `BREAK`
-(`FUN_004bb26a`) precedes the KC first frame — BREAK is only used by `HC::Reset` and some init paths.
+**DTR = low, RTS = high, with a ~135-unit settle after raising RTS**. This preamble is
+**unconditional** — every KC send (`FUN_0046cd29`/`FUN_0046ced1`) performs it before the first byte;
+there is no code path that emits a KC frame without it. (I can confirm VCDS always does this preamble;
+I cannot verify from the binary that its absence is specifically what silenced your bench attempt —
+only that VCDS never omits it.) No `BREAK` (`FUN_004bb26a`) precedes the KC first frame — BREAK is
+used only by `HC::Reset` and some init paths. **Note:** the KC stack is a *different* interface
+generation from yours (your `84…` reply is the HC stack); the KC `D`/`I` init and this preamble apply
+to the KC-type serial adapter, not necessarily to your HC-stack HEX-USB+CAN.
 
 ---
 
