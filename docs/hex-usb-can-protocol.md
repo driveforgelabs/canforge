@@ -312,6 +312,46 @@ of this.
 > the static answer anyway, the next RE step is to locate the interface object's vtable +0x88/+0x8C
 > targets for the K-line session and the KW1281 block packager — ask and I'll trace it.
 
+### Follow-up Q&A — dispatch gating, the 0x1B train, raw byte writes, KC preamble
+
+**Q1. After `0x9A`, does a `+0x9BE` ("connected") check silence/reroute non-init HC dispatch?** **No.**
+`+0x9BE` is the connected/live flag (set by SlowInit, FastInit, and `0x9A`/`FUN_00455aa3`). Its only
+read is in **`HC::Reset` (`FUN_00453a97`)**, where `+0x9BE != 0` just prepends a BREAK pulse
+(`FUN_004bb26a`) before the reset command. The HC send dispatcher **`FUN_00452ea9` (vtable +0x88)
+branches solely on `DAT_0097facc`** (`==2` → CAN, whole-frame; else → K-line, byte-by-byte) and
+**never reads `+0x9BE`**; the receive classifier (`FUN_004596b2`/`FUN_0045a1ef`, in `vcds.v2layer.c`)
+has **zero** `+0x9BE` references. So VCDS does not gate dispatch on the connected flag — "only `0x84`
+answers after `0x9A`" is the **MCU firmware's** state machine, not a host-side routing change.
+
+**Q2. What emits the `0x1B` train, and does any host write stop it?** The `0x1B` bytes are **not
+referenced anywhere in VCDS** (re-confirmed across all K-line sources) — VCDS neither emits nor
+consumes them, so they are **interface-firmware** output. After SlowInit VCDS writes **no raw stream
+payload**; its next output is always a framed command. There is no secret "write-this-to-the-stream"
+step in VCDS — the only thing that changes interface state post-init is a framed HC command
+(`0x9A` finalize is the best candidate, per the previous section).
+
+**Q3. Does VCDS ever write plain (non-`53`-framed) bytes on the FTDI stream — decisive via
+`FUN_004cd118` callers?** **Decisively: exactly one raw byte, `0xA5`, and only pre-init.**
+`FUN_004cd118` (single-byte `WriteFile`) is called only by `FUN_004bb1b6`, whose direct callers are:
+(a) **`FUN_00451cdf` (interface detect)** → `FUN_004bb1b6(0xA5)` (`PUSH -0x5B` at `0x451EAF`), then
+reads expecting `'C'`/`'D'`/`'F'` — a raw **sync/identify** byte; (b) `FUN_00452ea9` (HC::SendCommand)
+— emits the `53` **frame** byte-by-byte; (c) `FUN_0046cd29`/`FUN_0046ced1` (KC) — emit the KC
+`[len][payload][xor]` **frame** byte-by-byte. So the **only** non-framed raw write VCDS ever does is
+`0xA5`, during interface detection **before** diagnostics — **not after SlowInit**. The missing
+handshake is therefore not a hidden post-init raw byte in VCDS; `0xA5` is the one raw sync byte (worth
+trying as a re-sync if the interface is stuck, but it is a detect-phase byte, not a per-session step).
+
+**Q4. KC slow init `44 <mode> 00` — is `<mode>` required, does `0x00` apply, and is a DTR/BREAK
+preamble needed?** `<mode>` = the global `DAT_005CF9F4` (config token, **default `0`**), so **`0x00`
+is correct** unless a config set it otherwise. **A preamble IS required and is in `FUN_0046cd29`
+before the first byte:** `FUN_004bb22f` → `FUN_004cd0bd` (set comm state/baud) + `FUN_004bb1ef(fedc,
+'C')` = **clear DTR** + `FUN_004bb20f(fedc,'C')` = **clear RTS**; then `FUN_004bb20f(fedc,'S')` =
+**set RTS**; then **~135-unit delay** (`FUN_004704b6(0x87)`); then `FUN_004bb163` = **flush RX**; then
+the bytes stream out; afterwards `~20` delay + **clear RTS**. Net line state during the frame:
+**DTR = low, RTS = high, with a ~135 ms settle after raising RTS**. Silence with `mode=00` most
+likely means the **RTS-high + settle + flush preamble** (not the mode byte) was missing. No `BREAK`
+(`FUN_004bb26a`) precedes the KC first frame — BREAK is only used by `HC::Reset` and some init paths.
+
 ---
 
 Raw decompiler output backing this doc: `re-work/vcds.sio.c`, `vcds.ftdi.c`, `vcds.open.c`,
