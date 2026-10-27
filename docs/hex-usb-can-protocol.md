@@ -255,6 +255,22 @@ the payload and the trailing XOR. VCDS's receive parser (`FUN_00452f6a` reads th
 (length `+0x1F8`). The echo value cannot be pinned to a number because its request opcode (Q1) isn't
 in this binary.
 
+**Definitive resolution — the post-`0x84` block sequence is not in VCDS 26.9, and here is where it
+is.** Every ECU data/block request in VCDS goes through the message sender `FUN_0045935c` as a
+message *command*: the request opcodes seen at its call sites are `0x20`/`0x21`/`0x2D`/`0x2E` (KWP
+ReadData family), `0x44`, `0x17`, `0x49`, `0x1FB`, `5`, `8`. `FUN_0045935c` transmits only via
+`FUN_0045a9fa` (fedc 7/8 — proven, zero FTDI calls). The FTDI-capable `+0x88` dispatcher carries
+**only** interface-control opcodes (the map above) — **none** of `0x20`/`0x21`/`0x2D`/`0x2E` is ever
+sent through it. So there is **no frame — none — that VCDS 26.9 sends over this FTDI interface after
+`0x84`**; the question "what post-init write stops the `0x1B` train" has the concrete answer **"VCDS
+26.9 sends no such write; the sequence does not exist in this binary."** The post-`0x84` block
+protocol (and whatever quiets `0x1B`) lives in exactly two places, neither in this executable: **(a)
+the interface MCU firmware** (which owns the KW1281 byte loop — B3), and **(b) an older VCDS release**
+that still drove the HEX-USB+CAN for live diagnostics (pre-HEX-V2 era). To recover the exact frames,
+analyze one of those artifacts; from VCDS 26.9 it is provably unavailable. Practical path for the
+implementer: treat the interface as a transparent K-line bridge after `0x84` and drive KW1281 to the
+ISO/standard, or obtain an older VCDS for a reference capture.
+
 **Q: SlowInit (`0x84`) reply layout?** [C] `84 | <measured baud, 32-bit LE> | KW_lo KW_hi`:
 byte0 `0x84`=ok (else byte1 is an error code `03`/`09`/`04`); bytes1–4 = interface-measured K-line
 baud (logged `B: %d`); **bytes 5–6 = KW pair** (`local_ff`,`local_fe`). Live `84 8C 25 00 00 01 8A` →
