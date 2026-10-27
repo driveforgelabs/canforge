@@ -271,6 +271,36 @@ analyze one of those artifacts; from VCDS 26.9 it is provably unavailable. Pract
 implementer: treat the interface as a transparent K-line bridge after `0x84` and drive KW1281 to the
 ISO/standard, or obtain an older VCDS for a reference capture.
 
+**Where the post-`0x84` protocol physically lives, and how to get it.** The interface MCU firmware
+ships inside the VCDS install: `C:\Ross-Tech\VCDS\HCC196.bin` is the **HEX-USB+CAN** firmware
+(HCC = Hex-Com+Can, v1.96; 15 872 bytes). Siblings: `HC196.bin` (HEX-USB), `HP196.bin` (HEX-PRO),
+`HN121.bin` (HEX-NET). This firmware is the authority for the block loop, the `0x1B` prompt, and the
+block-relay opcode — but it is **encrypted** (entropy 7.90, no plaintext strings, a scrambled
+repeating structure). Recovering the protocol from it would require defeating VCDS's firmware
+encryption; that is a protection-circumvention step and is **out of scope** — not attempted here.
+So the exact post-`0x84` frames are obtainable only by (a) decrypting that firmware, (b) a capture
+from an older VCDS that drove this interface live, or (c) empirical probing of your own MCU.
+
+**Concrete empirical procedure (what to send after `0x84`), from everything verified above.** Your MCU
+speaks the HC `53`/`4D` frame and echoes the opcode (`0xFF` = unknown/!ready). Use that as an oracle:
+1. Keep the same framing you already proved works: `53 | L | <op> <args…> | xor`, `L = payload+3`,
+   `xor` seeded from `0x53`; valid replies are `4D | L | <echo> … | xor`.
+2. Right after a good `0x84`, within the **first `0x1B` window** (you have ~116 ms before the next
+   prompt; the train is only 3 long, so don't wait it out), probe single-byte opcodes `53 04 <op> <xor>`
+   and watch the echo: an opcode the MCU accepts echoes **itself** (not `0xFF`). Prioritise the gaps
+   around the known K-line ops — e.g. `0x86`, `0x87`, `0x88`, `0x89`, `0x8A`, `0x90`, `0x93`, `0x9B`–`0x9F`
+   (you already have `0x84`/`0x85`/`0x98`/`0x9A`/`0x82`/`0x02`/`0x03`/`0xA0`).
+3. For the one that echoes non-`0xFF`, resend it carrying your KW1281 block as payload
+   (`53 | L | <op> [counter][title][data…] | xor`) and read the `4D` reply; a data reply comes back as
+   reply-state 6/7 with the ECU block at the echoed frame's body.
+This is the deterministic way to find the firmware-defined opcode without the firmware; the oracle is
+the MCU's own opcode echo, which you have already observed working (`0x84`→`84`, `0x03`→`FF`).
+
+**Q4 causal note (explicit):** whether your bench silence was specifically the missing RTS/settle/flush
+preamble is **not a static-analysis question** — it is about your client's behaviour, which isn't in
+any binary. The verified static facts are: the preamble is unconditional in VCDS's KC send, and `mode=00`
+is correct. Causation can only be settled on the bench (add the preamble, observe).
+
 **Q: SlowInit (`0x84`) reply layout?** [C] `84 | <measured baud, 32-bit LE> | KW_lo KW_hi`:
 byte0 `0x84`=ok (else byte1 is an error code `03`/`09`/`04`); bytes1–4 = interface-measured K-line
 baud (logged `B: %d`); **bytes 5–6 = KW pair** (`local_ff`,`local_fe`). Live `84 8C 25 00 00 01 8A` →
