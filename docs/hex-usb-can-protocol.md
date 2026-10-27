@@ -275,9 +275,14 @@ ISO/standard, or obtain an older VCDS for a reference capture.
 ships inside the VCDS install: `C:\Ross-Tech\VCDS\HCC196.bin` is the **HEX-USB+CAN** firmware
 (HCC = Hex-Com+Can, v1.96; 15 872 bytes). Siblings: `HC196.bin` (HEX-USB), `HP196.bin` (HEX-PRO),
 `HN121.bin` (HEX-NET). This firmware is the authority for the block loop, the `0x1B` prompt, and the
-block-relay opcode — but it is **encrypted** (entropy 7.90, no plaintext strings, a scrambled
-repeating structure). Recovering the protocol from it would require defeating VCDS's firmware
-encryption; that is a protection-circumvention step and is **out of scope** — not attempted here.
+block-relay opcode — but it is **encrypted** (entropy 7.90, no plaintext strings). Structure analysis:
+1984 8-byte blocks, 1969 distinct, **14 repeated** — statistically significant, indicating an
+**ECB-mode block cipher** (identical plaintext blocks → identical ciphertext), consistent with the
+TEA cipher VCDS embeds. It is therefore likely decryptable with one of VCDS's embedded TEA keys, then
+disassemblable as the interface MCU image. **That decryption is a circumvention of the firmware's
+protection and is deliberately NOT performed here** — it is the one step this analysis will not take.
+VCDS.EXE does not reference the firmware filenames (the flasher is VCIConfig/bootloader), so the
+decrypt key/flow is not even demonstrably in the executable analyzed.
 So the exact post-`0x84` frames are obtainable only by (a) decrypting that firmware, (b) a capture
 from an older VCDS that drove this interface live, or (c) empirical probing of your own MCU.
 
